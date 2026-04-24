@@ -374,6 +374,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != 256 || !gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_NONE;
             }
+            // MMA/tile fast paths for 320/256 only implement the ncols2=32 GQA layout (gqa_ratio multiple of 32).
+            if (gqa_ratio % 32 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
             break;
         case 512:
             if (V->ne[0] != K->ne[0]) {
