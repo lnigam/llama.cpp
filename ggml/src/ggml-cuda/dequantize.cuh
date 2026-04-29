@@ -97,3 +97,15 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x *= d;
     v.y *= d;
 }
+
+static __device__ __forceinline__ void dequantize_q8_1(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q8_1 * x = (const block_q8_1 *) vx;
+
+    const float d = __low2float(x[ib].ds);
+
+    v.x = x[ib].qs[iqs + 0];
+    v.y = x[ib].qs[iqs + 1];
+
+    v.x *= d;
+    v.y *= d;
+}

@@ -647,6 +647,99 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
 }
 
+// rms_norm_q: fused rms_norm(x)*w → Q8_1
+
+template <int block_size>
+static __global__ void rms_norm_q8_1_f32(
+        const float * __restrict__ x,
+        const float * __restrict__ w,
+        void        * __restrict__ dst,
+        const int     ncols,
+        const int64_t stride_row,
+        const float   eps) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    x += row * stride_row;
+
+    // Phase 1: compute mean of squares across all ncols elements
+    float sum_sq = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        sum_sq += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    sum_sq = block_reduce<block_reduce_method::SUM, block_size>(sum_sq, s_sum);
+
+    const float rms_scale = rsqrtf(sum_sq / ncols + eps);
+
+    // Phase 2: normalize, apply scale weight, quantize to Q8_1 blocks
+    // Each warp (QK8_1=32 threads) handles one Q8_1 block per iteration
+    const int warp_id = tid / QK8_1;
+    const int lane    = tid % QK8_1;
+    const int n_warps = block_size / QK8_1;
+
+    block_q8_1 * y = (block_q8_1 *) dst + row * (ncols / QK8_1);
+
+    for (int ib = warp_id; ib < ncols / QK8_1; ib += n_warps) {
+        const int   col = ib * QK8_1 + lane;
+        const float xi  = rms_scale * x[col] * w[col];
+
+        float amax = fabsf(xi);
+        float vsum = xi;
+        amax = warp_reduce_max<QK8_1>(amax);
+        vsum = warp_reduce_sum<QK8_1>(vsum);
+
+        const float  d = amax / 127.0f;
+        const int8_t q = (amax == 0.0f) ? 0 : (int8_t)roundf(xi / d);
+
+        y[ib].qs[lane] = q;
+        if (lane == 0) {
+            y[ib].ds = make_half2(__float2half(d), __float2half(vsum));
+        }
+    }
+}
+
+static void rms_norm_q8_1_f32_cuda(
+        const float * x, const float * w, void * dst,
+        const int ncols, const int nrows, const int64_t stride_row,
+        const float eps, cudaStream_t stream) {
+    GGML_ASSERT(ncols % QK8_1 == 0);
+    const dim3 blocks_num(nrows, 1, 1);
+    const size_t shmem = 32 * sizeof(float); // for block_reduce intermediate results
+    if (ncols < 1024) {
+        rms_norm_q8_1_f32<256><<<blocks_num, 256, shmem, stream>>>(x, w, dst, ncols, stride_row, eps);
+    } else {
+        rms_norm_q8_1_f32<1024><<<blocks_num, 1024, shmem, stream>>>(x, w, dst, ncols, stride_row, eps);
+    }
+}
+
+void ggml_cuda_op_rms_norm_q(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0]; // input activations
+    const ggml_tensor * src1 = dst->src[1]; // rms_norm scale weights
+    const float * src0_d = (const float *) src0->data;
+    const float * src1_d = (const float *) src1->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_Q8_1);
+    GGML_ASSERT(src0->ne[0] % QK8_1 == 0);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int     ncols      = src0->ne[0];
+    const int     nrows      = ggml_nrows(src0);
+    const int64_t stride_row = src0->nb[1] / sizeof(float);
+
+    rms_norm_q8_1_f32_cuda(src0_d, src1_d, dst->data, ncols, nrows, stride_row, eps, stream);
+}
+
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;

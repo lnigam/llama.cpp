@@ -26,7 +26,7 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
-        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+        cur = ggml_rms_norm_q(ctx0, inpL, model.layers[il].attn_norm, hparams.f_norm_rms_eps);
         cb(cur, "attn_norm", il);
 
         ggml_build_forward_expand(gf, cur);
@@ -73,7 +73,7 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     cur = inpL;
 
     // Final norm
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cur = ggml_rms_norm_q(ctx0, cur, model.output_norm, hparams.f_norm_rms_eps);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;

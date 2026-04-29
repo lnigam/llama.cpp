@@ -1687,6 +1687,82 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+static void ggml_compute_forward_rms_norm_q(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0]; // input activations (F32)
+    const struct ggml_tensor * src1 = dst->src[1]; // rms norm weights (F32)
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_Q8_1);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->ne[0] % QK8_1 == 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+    const int64_t nb01 = src0->nb[1];
+    const int64_t nb02 = src0->nb[2];
+    const int64_t nb03 = src0->nb[3];
+    const int64_t nb1  = dst->nb[1];
+    const int64_t nb2  = dst->nb[2];
+    const int64_t nb3  = dst->nb[3];
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const float *  w               = (const float *) src1->data;
+    const int64_t  n_blocks_per_row = ne00 / QK8_1;
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const float * x = (const float *)((const char *)src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                block_q8_1   * y = (block_q8_1  *)((char *)dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+
+                // Phase 1: compute sum of squares for rms scale
+                double sum_sq = 0.0;
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    sum_sq += (double)(x[i00] * x[i00]);
+                }
+                const float rms_scale = 1.0f / sqrtf((float)(sum_sq / ne00) + eps);
+
+                // Phase 2: normalize × weight, quantize to Q8_1 blocks
+                for (int64_t ib = 0; ib < n_blocks_per_row; ib++) {
+                    const int64_t col_base = ib * QK8_1;
+
+                    float amax = 0.0f;
+                    for (int lane = 0; lane < QK8_1; lane++) {
+                        const float xi = rms_scale * x[col_base + lane] * w[col_base + lane];
+                        const float ax = fabsf(xi);
+                        if (ax > amax) amax = ax;
+                    }
+
+                    const float d    = amax / 127.0f;
+                    const float d_inv = (amax == 0.0f) ? 0.0f : 127.0f / amax;
+
+                    int sum_qs = 0;
+                    for (int lane = 0; lane < QK8_1; lane++) {
+                        const float xi  = rms_scale * x[col_base + lane] * w[col_base + lane];
+                        const int8_t q  = (int8_t)roundf(xi * d_inv);
+                        y[ib].qs[lane]  = q;
+                        sum_qs         += q;
+                    }
+
+                    y[ib].d = GGML_FP32_TO_FP16(d);
+                    y[ib].s = GGML_FP32_TO_FP16(sum_qs * d);
+                }
+            }
+        }
+    }
+}
+
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -1813,6 +1889,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_L2_NORM:
             {
                 ggml_compute_forward_l2_norm(params, tensor);
+            } break;
+        case GGML_OP_RMS_NORM_Q:
+            {
+                ggml_compute_forward_rms_norm_q(params, tensor);
             } break;
         case GGML_OP_MUL_MAT:
             {
@@ -2283,6 +2363,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
+        case GGML_OP_RMS_NORM_Q:
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
