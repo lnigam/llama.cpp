@@ -2473,7 +2473,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_1);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
 
@@ -2482,7 +2482,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    if ((src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_1) && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
@@ -2512,6 +2512,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     // TODO: add asserts to verify this. should work with CUDA, HIP, etc.
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && "Q8_1 src1 must be handled by the MMVQ path above");
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(nb12 % nb11 == 0);
@@ -3995,18 +3996,55 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int32_t       mul_use_count = ggml_node_get_use_count(cgraph, i + 1);
         int                 found         = 0;
         bool                all_mul_mat   = true;
+        std::vector<ggml_tensor *> reshape_nodes;
+
         for (int j = i + 2; j < cgraph->n_nodes && found < mul_use_count; j++) {
             ggml_tensor * cand     = cgraph->nodes[j];
             const bool    uses_mul = cand->src[0] == mul_node || cand->src[1] == mul_node;
             if (!uses_mul) { continue; }
             found++;
-            if (cand->op != GGML_OP_MUL_MAT || cand->ne[1] > MMVQ_MAX_BATCH_SIZE) {
-                all_mul_mat = false;
-                break;
+
+            if (cand->op == GGML_OP_RESHAPE) {
+                const int32_t reshape_use_count = ggml_node_get_use_count(cgraph, j);
+                int reshape_found = 0;
+                for (int k = j + 1; k < cgraph->n_nodes && reshape_found < reshape_use_count; k++) {
+                    ggml_tensor * r = cgraph->nodes[k];
+                    if (r->src[0] != cand && r->src[1] != cand) { continue; }
+                    reshape_found++;
+                    const bool is_mmvq_op    = r->op == GGML_OP_MUL_MAT || r->op == GGML_OP_MUL_MAT_ID;
+                    const bool src0_quantized = r->src[0] && ggml_is_quantized(r->src[0]->type);
+                    const int64_t batch      = (r->op == GGML_OP_MUL_MAT_ID) ? r->ne[2] : r->ne[1];
+                    if (!is_mmvq_op || !src0_quantized || batch > MMVQ_MAX_BATCH_SIZE) {
+                        all_mul_mat = false;
+                        break;
+                    }
+                }
+                if (all_mul_mat && reshape_found == reshape_use_count) {
+                    reshape_nodes.push_back(cand);
+                } else {
+                    all_mul_mat = false;
+                    break;
+                }
+            } else {
+                const bool is_mmvq_op    = cand->op == GGML_OP_MUL_MAT || cand->op == GGML_OP_MUL_MAT_ID;
+                const bool src0_quantized = cand->src[0] && ggml_is_quantized(cand->src[0]->type);
+                const int64_t batch      = (cand->op == GGML_OP_MUL_MAT_ID) ? cand->ne[2] : cand->ne[1];
+                if (!is_mmvq_op || !src0_quantized || batch > MMVQ_MAX_BATCH_SIZE) {
+                    all_mul_mat = false;
+                    break;
+                }
             }
         }
+
         if (all_mul_mat && found == mul_use_count) {
             ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, node, mul_node);
+            for (ggml_tensor * reshape : reshape_nodes) {
+                reshape->type  = GGML_TYPE_Q8_1;
+                reshape->nb[0] = sizeof(block_q8_1);
+                reshape->nb[1] = (mul_node->ne[0] / QK8_1) * sizeof(block_q8_1);
+                reshape->nb[2] = reshape->nb[1] * reshape->ne[1];
+                reshape->nb[3] = reshape->nb[2] * reshape->ne[2];
+            }
         } else {
             ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul_node);
         }
