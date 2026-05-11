@@ -3996,20 +3996,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * mul_node = cgraph->nodes[i + 1];
         if (mul_node->type == GGML_TYPE_Q8_1) {
             ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, node, mul_node);
-            // patch any RESHAPE consumers so downstream MUL_MAT_ID sees Q8_1 strides
-            const int32_t mul_use_count = ggml_node_get_use_count(cgraph, i + 1);
-            int found = 0;
-            for (int j = i + 2; j < cgraph->n_nodes && found < mul_use_count; j++) {
-                ggml_tensor * cand = cgraph->nodes[j];
-                if (cand->src[0] != mul_node && cand->src[1] != mul_node) continue;
-                found++;
-                if (cand->op != GGML_OP_RESHAPE) continue;
-                cand->type  = GGML_TYPE_Q8_1;
-                cand->nb[0] = sizeof(block_q8_1);
-                cand->nb[1] = (mul_node->ne[0] / QK8_1) * sizeof(block_q8_1);
-                cand->nb[2] = cand->nb[1] * cand->ne[1];
-                cand->nb[3] = cand->nb[2] * cand->ne[2];
-            }
         } else {
             ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul_node);
         }
@@ -4387,28 +4373,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             ggml_tensor * cand = cgraph->nodes[j];
             if (cand->src[0] != mul && cand->src[1] != mul) continue;
             found++;
-
-            if (cand->op == GGML_OP_RESHAPE) {
-                const int32_t reshape_uc = ggml_node_get_use_count(cgraph, j);
-                int reshape_found = 0;
-                for (int k = j + 1; k < cgraph->n_nodes && reshape_found < reshape_uc; k++) {
-                    ggml_tensor * r = cgraph->nodes[k];
-                    if (r->src[0] != cand && r->src[1] != cand) continue;
-                    reshape_found++;
-                    const bool is_mmvq_op     = r->op == GGML_OP_MUL_MAT || r->op == GGML_OP_MUL_MAT_ID;
-                    const bool src0_quantized = r->src[0] && ggml_is_quantized(r->src[0]->type);
-                    const int64_t batch       = (r->op == GGML_OP_MUL_MAT_ID) ? r->ne[2] : r->ne[1];
-                    if (!is_mmvq_op || !src0_quantized || batch > MMVQ_MAX_BATCH_SIZE) {
-                        all_mmvq = false; break;
-                    }
-                }
-                if (all_mmvq && reshape_found != reshape_uc) all_mmvq = false;
-            } else {
-                const bool is_mmvq_op     = cand->op == GGML_OP_MUL_MAT || cand->op == GGML_OP_MUL_MAT_ID;
-                const bool src0_quantized = cand->src[0] && ggml_is_quantized(cand->src[0]->type);
-                const int64_t batch       = (cand->op == GGML_OP_MUL_MAT_ID) ? cand->ne[2] : cand->ne[1];
-                if (!is_mmvq_op || !src0_quantized || batch > MMVQ_MAX_BATCH_SIZE) all_mmvq = false;
-            }
+            const bool is_mmvq_op     = cand->op == GGML_OP_MUL_MAT || cand->op == GGML_OP_MUL_MAT_ID;
+            const bool src0_quantized = cand->src[0] && ggml_is_quantized(cand->src[0]->type);
+            const int64_t batch       = (cand->op == GGML_OP_MUL_MAT_ID) ? cand->ne[2] : cand->ne[1];
+            if (!is_mmvq_op || !src0_quantized || batch > MMVQ_MAX_BATCH_SIZE) all_mmvq = false;
         }
 
         if (!all_mmvq || found != mul_use_count) continue;
