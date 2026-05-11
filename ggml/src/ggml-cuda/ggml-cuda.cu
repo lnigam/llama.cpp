@@ -4366,6 +4366,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         if (mul->ne[0] % QK8_1 != 0)              continue;
 
         const int32_t mul_use_count = ggml_node_get_use_count(cgraph, i + 1);
+        if (mul_use_count == 0) continue;
         int  found    = 0;
         bool all_mmvq = true;
 
