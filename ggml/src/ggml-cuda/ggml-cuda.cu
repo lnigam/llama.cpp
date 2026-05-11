@@ -2344,6 +2344,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
+static inline bool ggml_cuda_mmvq_eligible(
+        const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * dst,  const bool bad_padding_clear) {
+    return ggml_is_quantized(src0->type) && !bad_padding_clear &&
+           (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_1) &&
+           dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -2353,9 +2361,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear &&
-                             (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_1) &&
-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+    bool use_mul_mat_vec_q = ggml_cuda_mmvq_eligible(src0, src1, dst, bad_padding_clear);
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2396,9 +2402,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
-        && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_Q8_1)
-        && dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+    bool use_mul_mat_vec_q = ggml_cuda_mmvq_eligible(src0, src1, dst, bad_padding_clear);
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
