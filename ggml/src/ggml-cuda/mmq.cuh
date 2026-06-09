@@ -4,7 +4,9 @@
 #include "vecdotq.cuh"
 #include "mma.cuh"
 
+#include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <cstdint>
 
 using namespace ggml_cuda_mma;
@@ -13,6 +15,25 @@ using namespace ggml_cuda_mma;
 #define MMQ_ITER_K             256
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
+
+static bool mmq_env_enabled(const char * name, const bool default_value = false) {
+    const char * v = std::getenv(name);
+    return v ? std::atoi(v) != 0 : default_value;
+}
+
+static int mmq_env_int(const char * name, const int default_value) {
+    const char * v = std::getenv(name);
+    return v ? std::atoi(v) : default_value;
+}
+
+static int mmq_largest_divisor_leq(const int value, const int limit) {
+    for (int d = std::min(value, limit); d > 0; --d) {
+        if (value % d == 0) {
+            return d;
+        }
+    }
+    return 1;
+}
 
 typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*vec_dot_mmq_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
@@ -3972,7 +3993,31 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    if (!args.use_stream_k) {
+    const int ntiles_dst = ntx * nty * ntzw;
+    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
+
+    bool use_stream_k = args.use_stream_k;
+    int nblocks_stream_k = GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm;
+
+    if (use_stream_k && mmq_env_enabled("GGML_CUDA_MMQ_STREAM_K_DIVISOR")) {
+        const int divisor_min_pct = std::max(0, std::min(100, mmq_env_int("GGML_CUDA_MMQ_STREAM_K_DIVISOR_MIN_PCT", 80)));
+        const int divisor_min_blocks = std::max(1, nsm * divisor_min_pct / 100);
+        const int divisor_blocks = mmq_largest_divisor_leq(ntiles_dst, nsm);
+        if (divisor_blocks >= divisor_min_blocks) {
+            nblocks_stream_k = divisor_blocks;
+        }
+    }
+
+    const bool stream_k_fixup_needed = ntiles_dst % nblocks_stream_k != 0;
+    if (use_stream_k && stream_k_fixup_needed && mmq_env_enabled("GGML_CUDA_MMQ_AVOID_FIXUP")) {
+        const int avoid_min_eff = std::max(0, std::min(100, mmq_env_int("GGML_CUDA_MMQ_AVOID_FIXUP_MIN_EFF", 80)));
+        if (tiles_efficiency_percent >= avoid_min_eff) {
+            use_stream_k = false;
+        }
+    }
+
+    if (!use_stream_k) {
         if (args.nrows_x % mmq_y == 0) {
             constexpr bool need_check = false;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -3995,14 +4040,11 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
-    const int ntiles_dst = ntx * nty * ntzw;
-    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
-    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    const dim3 block_nums_stream_k(nblocks_stream_k, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
-    const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+    const bool fixup_needed = stream_k_fixup_needed;
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);

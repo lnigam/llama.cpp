@@ -41,6 +41,41 @@ static bool diffusion_final_tokens_on_stop_enabled() {
     return v && std::strcmp(v, "0") != 0;
 }
 
+static bool diffusion_fused_topk_sample_enabled() {
+    const char * v = std::getenv("GGML_CUDA_DIFFUSION_FUSED_TOPK_SAMPLE");
+    return v && std::strcmp(v, "0") != 0;
+}
+
+static bool diffusion_tight_topk_enabled() {
+    const char * v = std::getenv("GGML_CUDA_DIFFUSION_TIGHT_TOPK");
+    return v && std::strcmp(v, "0") != 0;
+}
+
+static int diffusion_topk_local_k(const int heap_k) {
+    int requested = heap_k <= 256 ? 8 : 16;
+    if (const char * v = std::getenv("GGML_CUDA_DIFFUSION_TOPK_LOCAL_K")) {
+        requested = std::atoi(v);
+    }
+
+    const int min_local_k = std::max(1, (heap_k + 255) / 256);
+    if (requested <= 1) {
+        requested = 1;
+    } else if (requested <= 2) {
+        requested = 2;
+    } else if (requested <= 4) {
+        requested = 4;
+    } else if (requested <= 8) {
+        requested = 8;
+    } else {
+        requested = 16;
+    }
+
+    while (requested < min_local_k && requested < 16) {
+        requested <<= 1;
+    }
+    return requested;
+}
+
 struct diffusion_sample_scratch {
     int   * top_ids  = nullptr;
     int   * sampled  = nullptr;
@@ -194,17 +229,39 @@ static void diffusion_select_topk_local(
         const int heap_k,
         cudaStream_t stream) {
     constexpr int block_size = 256;
+    const int local_k = diffusion_topk_local_k(heap_k);
 
-    if (heap_k <= 256) {
-        constexpr int local_k = 8;
-        const size_t smem = (size_t) local_k * block_size * (sizeof(float) + sizeof(int));
-        diffusion_select_topk_local_kernel<local_k><<<n_tokens, block_size, smem, stream>>>(
-                logits, top_ids, n_vocab, heap_k);
-    } else {
-        constexpr int local_k = 16;
-        const size_t smem = (size_t) local_k * block_size * (sizeof(float) + sizeof(int));
-        diffusion_select_topk_local_kernel<local_k><<<n_tokens, block_size, smem, stream>>>(
-                logits, top_ids, n_vocab, heap_k);
+    switch (local_k) {
+        case 1: {
+            constexpr int local_k_t = 1;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int));
+            diffusion_select_topk_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, top_ids, n_vocab, heap_k);
+        } break;
+        case 2: {
+            constexpr int local_k_t = 2;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int));
+            diffusion_select_topk_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, top_ids, n_vocab, heap_k);
+        } break;
+        case 4: {
+            constexpr int local_k_t = 4;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int));
+            diffusion_select_topk_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, top_ids, n_vocab, heap_k);
+        } break;
+        case 8: {
+            constexpr int local_k_t = 8;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int));
+            diffusion_select_topk_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, top_ids, n_vocab, heap_k);
+        } break;
+        default: {
+            constexpr int local_k_t = 16;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int));
+            diffusion_select_topk_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, top_ids, n_vocab, heap_k);
+        } break;
     }
 }
 
@@ -295,6 +352,213 @@ static __device__ __forceinline__ uint32_t diffusion_rng_u32(uint32_t x) {
 static __device__ __forceinline__ float diffusion_rng_uniform(uint32_t seed, uint32_t step, uint32_t row) {
     const uint32_t x = diffusion_rng_u32(seed ^ (step * 0x9e3779b9u) ^ (row * 0x85ebca6bu));
     return ((x >> 8) + 0.5f) * (1.0f / 16777216.0f);
+}
+
+template<int LOCAL_K>
+static __global__ void diffusion_sample_topk_fused_local_kernel(
+        const float * __restrict__ logits,
+        const int n_vocab,
+        const int n_tokens,
+        const int top_k,
+        const int sc_k,
+        const float inv_temp,
+        const uint32_t seed,
+        const uint32_t step,
+        int * __restrict__ sampled,
+        int * __restrict__ argmax,
+        float * __restrict__ entropy,
+        int * __restrict__ sc_ids,
+        float * __restrict__ sc_probs) {
+    constexpr int block_size = 256;
+    constexpr int candidate_count = LOCAL_K * block_size;
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (row >= n_tokens) {
+        return;
+    }
+
+    float vals[LOCAL_K];
+    int ids[LOCAL_K];
+#pragma unroll
+    for (int i = 0; i < LOCAL_K; ++i) {
+        vals[i] = -FLT_MAX;
+        ids[i] = 0;
+    }
+
+    const float * row_logits = logits + (size_t) row * n_vocab;
+    for (int v = tid; v < n_vocab; v += blockDim.x) {
+        const float x = row_logits[v];
+        if (diffusion_should_swap_desc(vals[LOCAL_K - 1], ids[LOCAL_K - 1], x, v)) {
+            int pos = LOCAL_K - 1;
+#pragma unroll
+            for (int i = LOCAL_K - 1; i > 0; --i) {
+                if (pos == i && diffusion_should_swap_desc(vals[i - 1], ids[i - 1], x, v)) {
+                    vals[i] = vals[i - 1];
+                    ids[i] = ids[i - 1];
+                    --pos;
+                }
+            }
+            vals[pos] = x;
+            ids[pos] = v;
+        }
+    }
+
+    extern __shared__ unsigned char smem[];
+    float * s_vals = (float *) smem;
+    int * s_ids = (int *) (s_vals + candidate_count);
+    float * s_sum = (float *) (s_ids + candidate_count);
+    float * s_t = s_sum + block_size;
+
+#pragma unroll
+    for (int i = 0; i < LOCAL_K; ++i) {
+        const int dst = tid * LOCAL_K + i;
+        s_vals[dst] = vals[i];
+        s_ids[dst] = ids[i];
+    }
+    __syncthreads();
+
+    for (int k = 2; k <= candidate_count; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < candidate_count; i += blockDim.x) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    const bool descending = (i & k) == 0;
+                    const bool swap = descending
+                        ? diffusion_should_swap_desc(s_vals[i], s_ids[i], s_vals[ixj], s_ids[ixj])
+                        : diffusion_should_swap_desc(s_vals[ixj], s_ids[ixj], s_vals[i], s_ids[i]);
+                    if (swap) {
+                        const float tv = s_vals[i];
+                        s_vals[i] = s_vals[ixj];
+                        s_vals[ixj] = tv;
+                        const int ti = s_ids[i];
+                        s_ids[i] = s_ids[ixj];
+                        s_ids[ixj] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    const float max_l = s_vals[0] * inv_temp;
+    const int amax = s_ids[0];
+
+    float local_sum = 0.0f;
+    float local_t = 0.0f;
+    if (tid < top_k) {
+        const float d = s_vals[tid] * inv_temp - max_l;
+        const float e = expf(d);
+        local_sum = e;
+        local_t = d * e;
+    }
+
+    s_sum[tid] = local_sum;
+    s_t[tid] = local_t;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sum[tid] += s_sum[tid + stride];
+            s_t[tid] += s_t[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    const float z = s_sum[0];
+    const float t = s_t[0];
+
+    if (tid == 0) {
+        argmax[row] = amax;
+        entropy[row] = logf(z) - t / z;
+
+        const float r = diffusion_rng_uniform(seed, step, row) * z;
+        float cum = 0.0f;
+        int tok = amax;
+        for (int i = 0; i < top_k; ++i) {
+            const float d = s_vals[i] * inv_temp - max_l;
+            cum += expf(d);
+            if (cum >= r) {
+                tok = s_ids[i];
+                break;
+            }
+        }
+        sampled[row] = tok;
+
+        const int n_sc = min(sc_k, top_k);
+        for (int i = 0; i < sc_k; ++i) {
+            const int out = row * sc_k + i;
+            if (i < n_sc) {
+                sc_ids[out] = s_ids[i];
+                sc_probs[out] = expf(s_vals[i] * inv_temp - max_l) / z;
+            } else {
+                sc_ids[out] = 0;
+                sc_probs[out] = 0.0f;
+            }
+        }
+    }
+}
+
+static void diffusion_sample_topk_fused_local(
+        const float * logits,
+        const int n_vocab,
+        const int n_tokens,
+        const int top_k,
+        const int sc_k,
+        const float inv_temp,
+        const uint32_t seed,
+        const uint32_t step,
+        int * sampled,
+        int * argmax,
+        float * entropy,
+        int * sc_ids,
+        float * sc_probs,
+        cudaStream_t stream) {
+    constexpr int block_size = 256;
+    const int local_k = diffusion_topk_local_k(top_k);
+
+    switch (local_k) {
+        case 1: {
+            constexpr int local_k_t = 1;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
+                                2 * block_size * sizeof(float);
+            diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, seed, step,
+                    sampled, argmax, entropy, sc_ids, sc_probs);
+        } break;
+        case 2: {
+            constexpr int local_k_t = 2;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
+                                2 * block_size * sizeof(float);
+            diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, seed, step,
+                    sampled, argmax, entropy, sc_ids, sc_probs);
+        } break;
+        case 4: {
+            constexpr int local_k_t = 4;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
+                                2 * block_size * sizeof(float);
+            diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, seed, step,
+                    sampled, argmax, entropy, sc_ids, sc_probs);
+        } break;
+        case 8: {
+            constexpr int local_k_t = 8;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
+                                2 * block_size * sizeof(float);
+            diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, seed, step,
+                    sampled, argmax, entropy, sc_ids, sc_probs);
+        } break;
+        default: {
+            constexpr int local_k_t = 16;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
+                                2 * block_size * sizeof(float);
+            diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, seed, step,
+                    sampled, argmax, entropy, sc_ids, sc_probs);
+        } break;
+    }
 }
 
 static __device__ __forceinline__ bool diffusion_pair_gt(float a_val, int a_id, float b_val, int b_id) {
@@ -647,7 +911,7 @@ bool ggml_cuda_diffusion_sample_topk(
         }
     }
 
-    const int heap_k = top_k == 0 ? sc_k : std::max(top_k, sc_k);
+    const int heap_k = top_k == 0 || !diffusion_tight_topk_enabled() ? std::max(top_k, sc_k) : top_k;
     if (heap_k <= 0 || heap_k > 1024 || heap_k > n_vocab) {
         return false;
     }
@@ -664,56 +928,65 @@ bool ggml_cuda_diffusion_sample_topk(
 
     diffusion_sample_scratch * scratch = diffusion_get_scratch(stream, n_tokens, heap_k, sc_k);
     int * top_ids = scratch->top_ids;
-    bool top_ids_sorted = false;
-
-    const bool use_fast_topk = diffusion_fast_topk_enabled() && heap_k <= 1024 && n_vocab >= heap_k;
-    bool sync_required = !use_fast_topk;
-    if (use_fast_topk) {
-        diffusion_select_topk_local(logits_d, top_ids, n_vocab, n_tokens, heap_k, stream);
-        top_ids_sorted = true;
-    } else {
-#ifdef CUB_DIFFUSION_TOP_K_AVAILABLE
-        for (int row = 0; row < n_tokens; ++row) {
-            diffusion_top_k_cub(pool, logits_d + (size_t) row * n_vocab, top_ids + (size_t) row * heap_k, n_vocab, heap_k, stream);
-        }
-#elif defined(GGML_CUDA_USE_CUB)
-        ggml_cuda_pool_alloc<int> sorted_ids_alloc(pool, (size_t) n_tokens * n_vocab);
-        int * sorted_ids = sorted_ids_alloc.get();
-        argsort_f32_i32_cuda_cub(pool, logits_d, sorted_ids, n_vocab, n_tokens, GGML_SORT_ORDER_DESC, stream);
-        CUDA_CHECK(cudaMemcpy2DAsync(top_ids, heap_k * sizeof(int), sorted_ids, n_vocab * sizeof(int),
-                                     heap_k * sizeof(int), n_tokens, cudaMemcpyDeviceToDevice, stream));
-        top_ids_sorted = true;
-#else
-        if (n_vocab > 1024) {
-            return false;
-        }
-        ggml_cuda_pool_alloc<int> sorted_ids_alloc(pool, (size_t) n_tokens * n_vocab);
-        int * sorted_ids = sorted_ids_alloc.get();
-        argsort_f32_i32_cuda_bitonic(logits_d, sorted_ids, n_vocab, n_tokens, GGML_SORT_ORDER_DESC, stream);
-        CUDA_CHECK(cudaMemcpy2DAsync(top_ids, heap_k * sizeof(int), sorted_ids, n_vocab * sizeof(int),
-                                     heap_k * sizeof(int), n_tokens, cudaMemcpyDeviceToDevice, stream));
-        top_ids_sorted = true;
-#endif
-    }
-
-    if (!top_ids_sorted) {
-        const int heap_k_pad = next_power_of_2_host(heap_k);
-        const int sort_threads = std::max(32, heap_k_pad);
-        const size_t sort_smem = (size_t) heap_k_pad * (sizeof(int) + sizeof(float));
-        diffusion_sort_top_ids_kernel<<<n_tokens, sort_threads, sort_smem, stream>>>(
-                logits_d, top_ids, n_vocab, heap_k, heap_k_pad, inv_temp);
-    }
-
     const bool direct_self_cond_tensor = have_self_cond_tensor && !have_self_cond_host && diffusion_direct_selfcond_enabled();
     int * sc_ids_out = direct_self_cond_tensor ? (int *) result->self_cond_ids_tensor->data : scratch->sc_ids;
     float * sc_probs_out = direct_self_cond_tensor ? (float *) result->self_cond_probs_tensor->data : scratch->sc_probs;
 
     constexpr int block_size = 256;
-    diffusion_sample_kernel<<<n_tokens, block_size, 0, stream>>>(
-            logits_d, top_ids, n_vocab, n_tokens, top_k, heap_k, sc_k, inv_temp,
-            params->seed, params->step, params->top_k_tail_correction,
-            scratch->sampled, scratch->argmax, scratch->entropy,
-            sc_ids_out, sc_probs_out);
+    bool sync_required = false;
+    const bool use_fused_topk_sample = diffusion_fused_topk_sample_enabled() &&
+        top_k > 0 && top_k <= block_size && !params->top_k_tail_correction && n_vocab >= top_k;
+
+    if (use_fused_topk_sample) {
+        diffusion_sample_topk_fused_local(logits_d, n_vocab, n_tokens, top_k, sc_k, inv_temp,
+                params->seed, params->step, scratch->sampled, scratch->argmax, scratch->entropy,
+                sc_ids_out, sc_probs_out, stream);
+    } else {
+        bool top_ids_sorted = false;
+        const bool use_fast_topk = diffusion_fast_topk_enabled() && heap_k <= 1024 && n_vocab >= heap_k;
+        sync_required = !use_fast_topk;
+        if (use_fast_topk) {
+            diffusion_select_topk_local(logits_d, top_ids, n_vocab, n_tokens, heap_k, stream);
+            top_ids_sorted = true;
+        } else {
+#ifdef CUB_DIFFUSION_TOP_K_AVAILABLE
+            for (int row = 0; row < n_tokens; ++row) {
+                diffusion_top_k_cub(pool, logits_d + (size_t) row * n_vocab, top_ids + (size_t) row * heap_k, n_vocab, heap_k, stream);
+            }
+#elif defined(GGML_CUDA_USE_CUB)
+            ggml_cuda_pool_alloc<int> sorted_ids_alloc(pool, (size_t) n_tokens * n_vocab);
+            int * sorted_ids = sorted_ids_alloc.get();
+            argsort_f32_i32_cuda_cub(pool, logits_d, sorted_ids, n_vocab, n_tokens, GGML_SORT_ORDER_DESC, stream);
+            CUDA_CHECK(cudaMemcpy2DAsync(top_ids, heap_k * sizeof(int), sorted_ids, n_vocab * sizeof(int),
+                                         heap_k * sizeof(int), n_tokens, cudaMemcpyDeviceToDevice, stream));
+            top_ids_sorted = true;
+#else
+            if (n_vocab > 1024) {
+                return false;
+            }
+            ggml_cuda_pool_alloc<int> sorted_ids_alloc(pool, (size_t) n_tokens * n_vocab);
+            int * sorted_ids = sorted_ids_alloc.get();
+            argsort_f32_i32_cuda_bitonic(logits_d, sorted_ids, n_vocab, n_tokens, GGML_SORT_ORDER_DESC, stream);
+            CUDA_CHECK(cudaMemcpy2DAsync(top_ids, heap_k * sizeof(int), sorted_ids, n_vocab * sizeof(int),
+                                         heap_k * sizeof(int), n_tokens, cudaMemcpyDeviceToDevice, stream));
+            top_ids_sorted = true;
+#endif
+        }
+
+        if (!top_ids_sorted) {
+            const int heap_k_pad = next_power_of_2_host(heap_k);
+            const int sort_threads = std::max(32, heap_k_pad);
+            const size_t sort_smem = (size_t) heap_k_pad * (sizeof(int) + sizeof(float));
+            diffusion_sort_top_ids_kernel<<<n_tokens, sort_threads, sort_smem, stream>>>(
+                    logits_d, top_ids, n_vocab, heap_k, heap_k_pad, inv_temp);
+        }
+
+        diffusion_sample_kernel<<<n_tokens, block_size, 0, stream>>>(
+                logits_d, top_ids, n_vocab, n_tokens, top_k, heap_k, sc_k, inv_temp,
+                params->seed, params->step, params->top_k_tail_correction,
+                scratch->sampled, scratch->argmax, scratch->entropy,
+                sc_ids_out, sc_probs_out);
+    }
 
     if (result->update_canvas_on_device) {
         const int update_threads = next_power_of_2_host(n_tokens);
