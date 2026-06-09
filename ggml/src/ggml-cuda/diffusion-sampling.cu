@@ -31,6 +31,11 @@ static bool diffusion_fast_topk_enabled() {
     return !v || std::strcmp(v, "0") != 0;
 }
 
+static bool diffusion_direct_selfcond_enabled() {
+    const char * v = std::getenv("GGML_CUDA_DIFFUSION_DIRECT_SELFCOND");
+    return v && std::strcmp(v, "0") != 0;
+}
+
 struct diffusion_sample_scratch {
     int   * top_ids  = nullptr;
     int   * sampled  = nullptr;
@@ -694,12 +699,16 @@ bool ggml_cuda_diffusion_sample_topk(
                 logits_d, top_ids, n_vocab, heap_k, heap_k_pad, inv_temp);
     }
 
+    const bool direct_self_cond_tensor = have_self_cond_tensor && !have_self_cond_host && diffusion_direct_selfcond_enabled();
+    int * sc_ids_out = direct_self_cond_tensor ? (int *) result->self_cond_ids_tensor->data : scratch->sc_ids;
+    float * sc_probs_out = direct_self_cond_tensor ? (float *) result->self_cond_probs_tensor->data : scratch->sc_probs;
+
     constexpr int block_size = 256;
     diffusion_sample_kernel<<<n_tokens, block_size, 0, stream>>>(
             logits_d, top_ids, n_vocab, n_tokens, top_k, heap_k, sc_k, inv_temp,
             params->seed, params->step, params->top_k_tail_correction,
             scratch->sampled, scratch->argmax, scratch->entropy,
-            scratch->sc_ids, scratch->sc_probs);
+            sc_ids_out, sc_probs_out);
 
     if (result->update_canvas_on_device) {
         const int update_threads = next_power_of_2_host(n_tokens);
@@ -741,7 +750,7 @@ bool ggml_cuda_diffusion_sample_topk(
         CUDA_CHECK(cudaMemcpyAsync(result->self_cond_probs, scratch->sc_probs, (size_t) n_tokens * sc_k * sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
     }
-    if (have_self_cond_tensor) {
+    if (have_self_cond_tensor && !direct_self_cond_tensor) {
         CUDA_CHECK(cudaMemcpyAsync(result->self_cond_ids_tensor->data, scratch->sc_ids, (size_t) n_tokens * sc_k * sizeof(int),
                                    cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(result->self_cond_probs_tensor->data, scratch->sc_probs, (size_t) n_tokens * sc_k * sizeof(float),
