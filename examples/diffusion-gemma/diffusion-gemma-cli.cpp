@@ -209,8 +209,7 @@ int main(int argc, char ** argv) {
                                   llama_diffusion_sample_topk_supported(ctx);
     const bool use_device_self_cond = use_gpu_sampling && env_int("DG_DEVICE_SELFCOND", 1) != 0;
     const bool use_device_loop      = use_device_self_cond && env_int("DG_DEVICE_LOOP", 1) != 0;
-    const int device_early_stop_interval = use_device_loop ?
-        std::max(env_int("DG_DEVICE_EARLY_STOP_INTERVAL", 1), 0) : 0;
+    const int device_early_stop_interval = use_device_loop ? 1 : 0;
     llama_set_diffusion_gpu_sampling(ctx, use_gpu_sampling);
 
     LOG_INF("diffusion-gemma: prefix=%d canvas=%d max_canvases=%d steps=%d entropy_bound=%.3f temp=[%.2f,%.2f] n_ctx=%d mm=%d\n",
@@ -360,10 +359,10 @@ int main(int argc, char ** argv) {
         if (use_device_loop) {
             bool sampled_ok = true;
             const int block_step = n_steps - cur_step + 1;
+            const bool final_step = cur_step == 1;
             const bool use_device_early_stop = device_early_stop_interval > 0;
             const bool reset_stop_state = use_device_early_stop && block_step == 1;
-            const bool check_stop = use_device_early_stop &&
-                (cur_step == 1 || (block_step % device_early_stop_interval) == 0);
+            const bool check_stop = use_device_early_stop && !final_step;
             int32_t stop_flag = 0;
             const auto t_sample_start = std::chrono::steady_clock::now();
             llama_diffusion_sample_params sample_params = {
@@ -381,7 +380,7 @@ int main(int argc, char ** argv) {
                 /* .entropy         = */ nullptr,
                 /* .self_cond_ids   = */ nullptr,
                 /* .self_cond_probs = */ nullptr,
-                /* .final_tokens    = */ (cur_step == 1 || check_stop) ? argmax_canvas.data() : nullptr,
+                /* .final_tokens    = */ (final_step || check_stop) ? argmax_canvas.data() : nullptr,
                 /* .stop            = */ check_stop ? &stop_flag : nullptr,
                 /* .entropy_bound   = */ entropy_bound,
                 /* .confidence_threshold = */ CONFIDENCE_THRESHOLD,

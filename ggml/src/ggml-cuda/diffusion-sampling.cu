@@ -36,6 +36,11 @@ static bool diffusion_direct_selfcond_enabled() {
     return v && std::strcmp(v, "0") != 0;
 }
 
+static bool diffusion_final_tokens_on_stop_enabled() {
+    const char * v = std::getenv("GGML_CUDA_DIFFUSION_FINAL_TOKENS_ON_STOP");
+    return v && std::strcmp(v, "0") != 0;
+}
+
 struct diffusion_sample_scratch {
     int   * top_ids  = nullptr;
     int   * sampled  = nullptr;
@@ -736,7 +741,11 @@ bool ggml_cuda_diffusion_sample_topk(
         CUDA_CHECK(cudaMemcpyAsync(result->entropy, scratch->entropy, (size_t) n_tokens * sizeof(float),
                                    cudaMemcpyDeviceToHost, stream));
     }
-    if (result->final_tokens) {
+    const bool final_tokens_after_stop =
+        result->final_tokens && result->stop && result->check_stop_on_device &&
+        diffusion_final_tokens_on_stop_enabled();
+
+    if (result->final_tokens && !final_tokens_after_stop) {
         CUDA_CHECK(cudaMemcpyAsync(result->final_tokens, scratch->argmax, (size_t) n_tokens * sizeof(int),
                                    cudaMemcpyDeviceToHost, stream));
     }
@@ -758,9 +767,14 @@ bool ggml_cuda_diffusion_sample_topk(
     }
 
     const bool host_outputs_requested = result->sampled || result->argmax || result->entropy ||
-        result->final_tokens || result->stop || have_self_cond_host;
+        (result->final_tokens && !final_tokens_after_stop) || result->stop || have_self_cond_host;
     CUDA_CHECK(cudaGetLastError());
     if (sync_required || host_outputs_requested) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    if (final_tokens_after_stop && *result->stop != 0) {
+        CUDA_CHECK(cudaMemcpyAsync(result->final_tokens, scratch->argmax, (size_t) n_tokens * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     return true;
