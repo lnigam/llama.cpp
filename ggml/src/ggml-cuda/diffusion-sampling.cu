@@ -354,6 +354,107 @@ static __device__ __forceinline__ float diffusion_rng_uniform(uint32_t seed, uin
     return ((x >> 8) + 0.5f) * (1.0f / 16777216.0f);
 }
 
+static __device__ __forceinline__ float diffusion_apply_logit_softcap(const float x, const float softcap) {
+    return softcap > 0.0f ? softcap * tanhf(x / softcap) : x;
+}
+
+template<typename T>
+static __device__ __forceinline__ float diffusion_embd_to_float(const T x) {
+    return (float) x;
+}
+
+template<>
+__device__ __forceinline__ float diffusion_embd_to_float<half>(const half x) {
+    return __half2float(x);
+}
+
+template<typename T>
+static __global__ void diffusion_build_selfcond_embd_kernel(
+        const T * __restrict__ token_embd,
+        const int64_t embd_stride,
+        const int n_embd,
+        const int n_tokens,
+        const int sc_k,
+        const int * __restrict__ sc_ids,
+        const float * __restrict__ sc_probs,
+        float * __restrict__ dst) {
+    extern __shared__ unsigned char smem[];
+    int * s_ids = (int *) smem;
+    float * s_probs = (float *) (s_ids + sc_k);
+
+    const int token = blockIdx.y;
+    const int dim = blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (int i = threadIdx.x; i < sc_k; i += blockDim.x) {
+        const int off = token * sc_k + i;
+        s_ids[i] = sc_ids[off];
+        s_probs[i] = sc_probs[off];
+    }
+    __syncthreads();
+
+    if (token >= n_tokens || dim >= n_embd) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < sc_k; ++i) {
+        const float p = s_probs[i];
+        if (p != 0.0f) {
+            const int id = s_ids[i];
+            sum += p * diffusion_embd_to_float(token_embd[(int64_t) id * embd_stride + dim]);
+        }
+    }
+    dst[(int64_t) token * n_embd + dim] = sum;
+}
+
+static bool diffusion_build_selfcond_embd(
+        const ggml_tensor * token_embd,
+        const int * sc_ids,
+        const float * sc_probs,
+        const int n_tokens,
+        const int sc_k,
+        ggml_tensor * dst,
+        cudaStream_t stream) {
+    if (!token_embd || !dst || !sc_ids || !sc_probs) {
+        return false;
+    }
+    if (!ggml_is_contiguous(token_embd) || !ggml_is_contiguous(dst) ||
+        token_embd->data == nullptr || dst->data == nullptr ||
+        token_embd->buffer == nullptr || dst->buffer == nullptr ||
+        ggml_backend_buffer_is_host(token_embd->buffer) ||
+        ggml_backend_buffer_is_host(dst->buffer) ||
+        dst->type != GGML_TYPE_F32 ||
+        token_embd->ne[1] <= 0 ||
+        dst->ne[0] != token_embd->ne[0] ||
+        dst->ne[1] < n_tokens) {
+        return false;
+    }
+
+    const int n_embd = (int) token_embd->ne[0];
+    const int block_size = 256;
+    const dim3 block(block_size, 1, 1);
+    const dim3 grid((n_embd + block_size - 1) / block_size, n_tokens, 1);
+    const size_t smem = (size_t) sc_k * (sizeof(int) + sizeof(float));
+
+    switch (token_embd->type) {
+        case GGML_TYPE_F16: {
+            const int64_t embd_stride = token_embd->nb[1] / (int64_t) sizeof(half);
+            diffusion_build_selfcond_embd_kernel<half><<<grid, block, smem, stream>>>(
+                    (const half *) token_embd->data, embd_stride, n_embd, n_tokens, sc_k,
+                    sc_ids, sc_probs, (float *) dst->data);
+        } break;
+        case GGML_TYPE_F32: {
+            const int64_t embd_stride = token_embd->nb[1] / (int64_t) sizeof(float);
+            diffusion_build_selfcond_embd_kernel<float><<<grid, block, smem, stream>>>(
+                    (const float *) token_embd->data, embd_stride, n_embd, n_tokens, sc_k,
+                    sc_ids, sc_probs, (float *) dst->data);
+        } break;
+        default:
+            return false;
+    }
+    return true;
+}
+
 template<int LOCAL_K>
 static __global__ void diffusion_sample_topk_fused_local_kernel(
         const float * __restrict__ logits,
@@ -362,6 +463,7 @@ static __global__ void diffusion_sample_topk_fused_local_kernel(
         const int top_k,
         const int sc_k,
         const float inv_temp,
+        const float logit_softcap,
         const uint32_t seed,
         const uint32_t step,
         int * __restrict__ sampled,
@@ -441,6 +543,11 @@ static __global__ void diffusion_sample_topk_fused_local_kernel(
         }
     }
 
+    if (tid < top_k) {
+        s_vals[tid] = diffusion_apply_logit_softcap(s_vals[tid], logit_softcap);
+    }
+    __syncthreads();
+
     const float max_l = s_vals[0] * inv_temp;
     const int amax = s_ids[0];
 
@@ -506,6 +613,7 @@ static void diffusion_sample_topk_fused_local(
         const int top_k,
         const int sc_k,
         const float inv_temp,
+        const float logit_softcap,
         const uint32_t seed,
         const uint32_t step,
         int * sampled,
@@ -523,7 +631,7 @@ static void diffusion_sample_topk_fused_local(
             const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
                                 2 * block_size * sizeof(float);
             diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
-                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, seed, step,
+                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, logit_softcap, seed, step,
                     sampled, argmax, entropy, sc_ids, sc_probs);
         } break;
         case 2: {
@@ -531,7 +639,7 @@ static void diffusion_sample_topk_fused_local(
             const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
                                 2 * block_size * sizeof(float);
             diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
-                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, seed, step,
+                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, logit_softcap, seed, step,
                     sampled, argmax, entropy, sc_ids, sc_probs);
         } break;
         case 4: {
@@ -539,7 +647,7 @@ static void diffusion_sample_topk_fused_local(
             const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
                                 2 * block_size * sizeof(float);
             diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
-                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, seed, step,
+                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, logit_softcap, seed, step,
                     sampled, argmax, entropy, sc_ids, sc_probs);
         } break;
         case 8: {
@@ -547,7 +655,7 @@ static void diffusion_sample_topk_fused_local(
             const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
                                 2 * block_size * sizeof(float);
             diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
-                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, seed, step,
+                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, logit_softcap, seed, step,
                     sampled, argmax, entropy, sc_ids, sc_probs);
         } break;
         default: {
@@ -555,7 +663,7 @@ static void diffusion_sample_topk_fused_local(
             const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
                                 2 * block_size * sizeof(float);
             diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
-                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, seed, step,
+                    logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, logit_softcap, seed, step,
                     sampled, argmax, entropy, sc_ids, sc_probs);
         } break;
     }
@@ -691,6 +799,7 @@ static __global__ void diffusion_sample_kernel(
         const int heap_k,
         const int sc_k,
         const float inv_temp,
+        const float logit_softcap,
         const uint32_t seed,
         const uint32_t step,
         const bool tail_correction,
@@ -717,7 +826,7 @@ static __global__ void diffusion_sample_kernel(
 
     if (top_k == 0 || tail_correction) {
         for (int v = tid; v < n_vocab; v += blockDim.x) {
-            const float x = row_logits[v] * inv_temp;
+            const float x = diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp;
             if (x > local_max) {
                 local_max = x;
                 local_idx = v;
@@ -726,7 +835,7 @@ static __global__ void diffusion_sample_kernel(
     } else {
         for (int i = tid; i < top_k; i += blockDim.x) {
             const int v = row_top[i];
-            const float x = row_logits[v] * inv_temp;
+            const float x = diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp;
             if (x > local_max) {
                 local_max = x;
                 local_idx = v;
@@ -754,7 +863,7 @@ static __global__ void diffusion_sample_kernel(
 
     if (top_k == 0 || tail_correction) {
         for (int v = tid; v < n_vocab; v += blockDim.x) {
-            const float d = row_logits[v] * inv_temp - max_l;
+            const float d = diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp - max_l;
             const float e = expf(d);
             local_sum += e;
             local_t   += d * e;
@@ -762,7 +871,7 @@ static __global__ void diffusion_sample_kernel(
     } else {
         for (int i = tid; i < top_k; i += blockDim.x) {
             const int v = row_top[i];
-            const float d = row_logits[v] * inv_temp - max_l;
+            const float d = diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp - max_l;
             const float e = expf(d);
             local_sum += e;
             local_t   += d * e;
@@ -793,7 +902,7 @@ static __global__ void diffusion_sample_kernel(
             sample_z = 0.0f;
             for (int i = 0; i < top_k; ++i) {
                 const int v = row_top[i];
-                sample_z += expf(row_logits[v] * inv_temp - max_l);
+                sample_z += expf(diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp - max_l);
             }
         }
 
@@ -803,7 +912,7 @@ static __global__ void diffusion_sample_kernel(
 
         if (top_k == 0) {
             for (int v = 0; v < n_vocab; ++v) {
-                cum += expf(row_logits[v] * inv_temp - max_l);
+                cum += expf(diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp - max_l);
                 if (cum >= r) {
                     tok = v;
                     break;
@@ -812,7 +921,7 @@ static __global__ void diffusion_sample_kernel(
         } else {
             for (int i = 0; i < top_k; ++i) {
                 const int v = row_top[i];
-                cum += expf(row_logits[v] * inv_temp - max_l);
+                cum += expf(diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp - max_l);
                 if (cum >= r) {
                     tok = v;
                     break;
@@ -827,7 +936,7 @@ static __global__ void diffusion_sample_kernel(
             if (i < n_sc) {
                 const int v = row_top[i];
                 sc_ids[out] = v;
-                sc_probs[out] = expf(row_logits[v] * inv_temp - max_l) / sample_z;
+                sc_probs[out] = expf(diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp - max_l) / sample_z;
             } else {
                 sc_ids[out] = 0;
                 sc_probs[out] = 0.0f;
@@ -883,7 +992,8 @@ bool ggml_cuda_diffusion_sample_topk(
 
     const bool have_self_cond_host = result->self_cond_ids != nullptr && result->self_cond_probs != nullptr;
     const bool have_self_cond_tensor = result->self_cond_ids_tensor != nullptr && result->self_cond_probs_tensor != nullptr;
-    if (!have_self_cond_host && !have_self_cond_tensor) {
+    const bool have_self_cond_embd_tensor = result->self_cond_embd_tensor != nullptr;
+    if (!have_self_cond_host && !have_self_cond_tensor && !have_self_cond_embd_tensor) {
         return false;
     }
     if ((result->self_cond_ids == nullptr) != (result->self_cond_probs == nullptr)) {
@@ -910,6 +1020,27 @@ bool ggml_cuda_diffusion_sample_topk(
             return false;
         }
     }
+    if (have_self_cond_embd_tensor) {
+        if (result->token_embd_tensor == nullptr ||
+            result->token_embd_tensor->data == nullptr ||
+            result->token_embd_tensor->buffer == nullptr ||
+            result->self_cond_embd_tensor->type != GGML_TYPE_F32 ||
+            result->self_cond_embd_tensor->data == nullptr ||
+            result->self_cond_embd_tensor->buffer == nullptr ||
+            ggml_backend_buffer_is_host(result->token_embd_tensor->buffer) ||
+            ggml_backend_buffer_is_host(result->self_cond_embd_tensor->buffer) ||
+            !ggml_is_contiguous(result->token_embd_tensor) ||
+            !ggml_is_contiguous(result->self_cond_embd_tensor) ||
+            result->token_embd_tensor->ne[1] < n_vocab ||
+            result->self_cond_embd_tensor->ne[0] != result->token_embd_tensor->ne[0] ||
+            result->self_cond_embd_tensor->ne[1] < n_tokens) {
+            return false;
+        }
+        if (result->token_embd_tensor->type != GGML_TYPE_F16 &&
+            result->token_embd_tensor->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
 
     const int heap_k = top_k == 0 || !diffusion_tight_topk_enabled() ? std::max(top_k, sc_k) : top_k;
     if (heap_k <= 0 || heap_k > 1024 || heap_k > n_vocab) {
@@ -918,6 +1049,7 @@ bool ggml_cuda_diffusion_sample_topk(
 
     const float temp = params->temperature > 0.0f ? params->temperature : 1.0f;
     const float inv_temp = 1.0f / temp;
+    const float logit_softcap = params->logit_softcap > 0.0f ? params->logit_softcap : 0.0f;
 
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(ctx->device);
@@ -938,7 +1070,7 @@ bool ggml_cuda_diffusion_sample_topk(
         top_k > 0 && top_k <= block_size && !params->top_k_tail_correction && n_vocab >= top_k;
 
     if (use_fused_topk_sample) {
-        diffusion_sample_topk_fused_local(logits_d, n_vocab, n_tokens, top_k, sc_k, inv_temp,
+        diffusion_sample_topk_fused_local(logits_d, n_vocab, n_tokens, top_k, sc_k, inv_temp, logit_softcap,
                 params->seed, params->step, scratch->sampled, scratch->argmax, scratch->entropy,
                 sc_ids_out, sc_probs_out, stream);
     } else {
@@ -983,7 +1115,7 @@ bool ggml_cuda_diffusion_sample_topk(
 
         diffusion_sample_kernel<<<n_tokens, block_size, 0, stream>>>(
                 logits_d, top_ids, n_vocab, n_tokens, top_k, heap_k, sc_k, inv_temp,
-                params->seed, params->step, params->top_k_tail_correction,
+                logit_softcap, params->seed, params->step, params->top_k_tail_correction,
                 scratch->sampled, scratch->argmax, scratch->entropy,
                 sc_ids_out, sc_probs_out);
     }
@@ -1037,6 +1169,12 @@ bool ggml_cuda_diffusion_sample_topk(
                                    cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(result->self_cond_probs_tensor->data, scratch->sc_probs, (size_t) n_tokens * sc_k * sizeof(float),
                                    cudaMemcpyDeviceToDevice, stream));
+    }
+    if (have_self_cond_embd_tensor) {
+        if (!diffusion_build_selfcond_embd(result->token_embd_tensor, sc_ids_out, sc_probs_out, n_tokens, sc_k,
+                result->self_cond_embd_tensor, stream)) {
+            return false;
+        }
     }
 
     const bool host_outputs_requested = result->sampled || result->argmax || result->entropy ||

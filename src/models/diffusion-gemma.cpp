@@ -3,6 +3,42 @@
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+
+static bool diffusion_gemma_fuse_final_logit_softcap_enabled() {
+    const char * v = std::getenv("GGML_CUDA_DIFFUSION_FUSE_FINAL_SOFTCAP");
+    return v && std::strcmp(v, "0") != 0;
+}
+
+static bool diffusion_gemma_env_enabled_default(const char * name, bool def) {
+    const char * v = std::getenv(name);
+    if (!v) {
+        return def;
+    }
+    return std::strcmp(v, "0") != 0;
+}
+
+static bool diffusion_gemma_fused_selfcond_embd_enabled() {
+    return diffusion_gemma_env_enabled_default("GGML_CUDA_DIFFUSION_FUSED_SELFCOND_EMBD", false) &&
+        diffusion_gemma_env_enabled_default("DG_DEVICE_SELFCOND", true);
+}
+
+static int64_t diffusion_gemma_self_cond_top_k() {
+    const int64_t def = llama_model_diffusion_gemma::N_SC_TOPK;
+    const char * v = std::getenv("GGML_CUDA_DIFFUSION_SC_TOPK");
+    if (!v) {
+        return def;
+    }
+
+    const int64_t k = std::atoll(v);
+    if (k <= 0) {
+        return def;
+    }
+    return std::min(k, def);
+}
+
 // diffusion_gemma reuses the gemma4 decoder block (tensor layout + per-layer math) but runs
 // as a bidirectional (non-causal) block-diffusion denoiser over a canvas, with KV-cache reuse:
 // the prompt / previously-finalized canvases form a causal, read-only prefix in the unified
@@ -123,7 +159,7 @@ void llama_model_diffusion_gemma::load_arch_post(llama_model_loader & ml) {
                            __func__, (long long) n_embd_t, (long long) n_vocab_t,
                            ggml_nbytes(tok_embd_gpu) / (1024.0 * 1024.0 * 1024.0),
                            ggml_backend_buffer_name(tok_embd_gpu->buffer),
-                           (long long) N_SC_TOPK);
+                           (long long) diffusion_gemma_self_cond_top_k());
             return;
         }
         LLAMA_LOG_WARN("%s: failed to allocate on-device gather embedding; falling back to dense matmul\n", __func__);
@@ -186,6 +222,9 @@ ggml_tensor * llama_model_diffusion_gemma::graph_base::build_input(bool is_decod
     const auto & dmodel = static_cast<const llama_model_diffusion_gemma &>(model);
 
     ggml_tensor * inpL = build_inp_embd(dmodel.tok_embd_gpu ? dmodel.tok_embd_gpu : model.tok_embd);
+    if (dmodel.tok_embd_gpu) {
+        res->t_diffusion_token_embd = dmodel.tok_embd_gpu;
+    }
 
     // scaled word embeddings (sqrt(hidden_size)); raw embeddings input is not scaled
     inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
@@ -194,12 +233,14 @@ ggml_tensor * llama_model_diffusion_gemma::graph_base::build_input(bool is_decod
     if (is_decoder) {
         ggml_tensor * soft; // soft-embedding {n_embd, n_tokens}: blend of the previous step's
                             // predicted token embeddings, scaled by sqrt(n_embd)
-        if (dmodel.tok_embd_gpu) {
+        if (dmodel.tok_embd_gpu && diffusion_gemma_fused_selfcond_embd_enabled()) {
+            soft = build_inp_diffusion_self_cond_embd(n_embd);
+        } else if (dmodel.tok_embd_gpu) {
             // Sparse gather path (Option-2): the previous step's top-k token ids+probs are fed per
             // position; gather just those k embedding rows and blend them, instead of the dense
             // full-vocab `probs @ token_embd` matmul. Gather width is fixed (N_SC_TOPK) so the
             // graph shape is constant; unused slots carry prob 0 (the CLI zero-pads).
-            const int64_t k = llama_model_diffusion_gemma::N_SC_TOPK;
+            const int64_t k = diffusion_gemma_self_cond_top_k();
             auto * inp = build_inp_diffusion_self_cond_topk(k);
             ggml_tensor * ids   = inp->ids;                                                // I32 {k*n_tokens}
             ggml_tensor * probs = inp->probs;                                              // F32 {k, n_tokens}
@@ -419,7 +460,10 @@ void llama_model_diffusion_gemma::graph_base::build_transformer(ggml_tensor * in
 
     cur = build_lora_mm(model.output, cur, model.output_s);
 
-    if (hparams.f_final_logit_softcapping) {
+    const bool fuse_final_softcap =
+        diffusion && diffusion->decoder_phase && diffusion_gemma_fuse_final_logit_softcap_enabled();
+
+    if (hparams.f_final_logit_softcapping && !fuse_final_softcap) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
         cur = ggml_tanh(ctx0, cur);
         cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);

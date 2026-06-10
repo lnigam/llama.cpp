@@ -4102,7 +4102,13 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
 
-    const int mmq_x_max = get_mmq_x_max_host(cc);
+    int mmq_x_max = get_mmq_x_max_host(cc);
+    if (mmq_env_enabled("GGML_CUDA_MMQ_MAX_X")) {
+        const int mmq_x_max_env = mmq_env_int("GGML_CUDA_MMQ_MAX_X", mmq_x_max);
+        if (mmq_x_max_env > 0) {
+            mmq_x_max = std::min(mmq_x_max, std::max(8, 8 * (mmq_x_max_env / 8)));
+        }
+    }
     const int mmq_y = get_mmq_y_host(cc);
 
     int mmq_x_best  = 0;

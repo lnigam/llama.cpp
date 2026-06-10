@@ -99,6 +99,10 @@ struct llama_diffusion_cond {
     size_t   sc_topk_device_ids_bytes  = 0;
     size_t   sc_topk_device_probs_bytes = 0;
 
+    bool     sc_embd_device_ready = false;
+    void   * sc_embd_device_data  = nullptr;
+    size_t   sc_embd_device_bytes = 0;
+
     bool     canvas_tokens_device_ready = false;
     void   * canvas_tokens_device_data  = nullptr;
     size_t   canvas_tokens_device_bytes = 0;
@@ -347,6 +351,20 @@ public:
 
     ggml_tensor * ids;   // I32 [k*n_tokens] (flat; gathered into [n_embd, k*n_tokens])
     ggml_tensor * probs; // F32 [k, n_tokens]
+
+    const llama_diffusion_cond * diffusion;
+};
+
+// Dense diffusion self-conditioning embedding input. This is filled by the CUDA sampler from
+// top-k ids/probs when GGML_CUDA_DIFFUSION_FUSED_SELFCOND_EMBD is enabled.
+class llm_graph_input_diffusion_self_cond_embd : public llm_graph_input_i {
+public:
+    llm_graph_input_diffusion_self_cond_embd(const llama_diffusion_cond * diffusion) : diffusion(diffusion) {}
+    virtual ~llm_graph_input_diffusion_self_cond_embd() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * embd = nullptr; // F32 [n_embd, n_tokens]
 
     const llama_diffusion_cond * diffusion;
 };
@@ -796,7 +814,9 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
     ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
+    ggml_tensor * get_diffusion_token_embd() const { return t_diffusion_token_embd; }
     llm_graph_input_diffusion_self_cond_topk * get_inp_diffusion_self_cond_topk() const;
+    llm_graph_input_diffusion_self_cond_embd * get_inp_diffusion_self_cond_embd() const;
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -827,6 +847,7 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_diffusion_token_embd = nullptr; // on-device F16 token embedding used by diffusion CUDA helpers
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -1039,6 +1060,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_diffusion_self_cond(int64_t n_vocab) const; // F32 [n_vocab, n_tokens]
     // sparse self-cond: returns the input object exposing ->ids (I32 [k,n_tokens]) and ->probs (F32 [k,n_tokens])
     llm_graph_input_diffusion_self_cond_topk * build_inp_diffusion_self_cond_topk(int64_t k) const;
+    ggml_tensor * build_inp_diffusion_self_cond_embd(int64_t n_embd) const; // F32 [n_embd, n_tokens]
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

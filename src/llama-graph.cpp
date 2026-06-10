@@ -453,6 +453,28 @@ void llm_graph_input_diffusion_self_cond_topk::set_input(const llama_ubatch * ub
     }
 }
 
+void llm_graph_input_diffusion_self_cond_embd::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (!embd) {
+        return;
+    }
+    assert(embd->type == GGML_TYPE_F32);
+
+    const size_t n_bytes = ggml_nbytes(embd);
+    const bool have_device = diffusion
+        && diffusion->sc_embd_device_ready
+        && diffusion->sc_embd_device_data  == embd->data
+        && diffusion->sc_embd_device_bytes == n_bytes;
+
+    if (have_device) {
+        return;
+    }
+
+    std::vector<uint8_t> zeros(n_bytes, 0);
+    ggml_backend_tensor_set(embd, zeros.data(), 0, n_bytes);
+}
+
 template <typename T>
 static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n_swa, llama_swa_type swa_type) {
     LLAMA_LOG_DEBUG("%s: === Attention mask ===\n", __func__);
@@ -1021,6 +1043,9 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_h_nextn     = nullptr;
+    t_h_pre_norm  = nullptr;
+    t_diffusion_token_embd = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1053,6 +1078,16 @@ llm_graph_input_diffusion_self_cond_topk * llm_graph_result::get_inp_diffusion_s
     for (auto & input : inputs) {
         if (auto * topk = dynamic_cast<llm_graph_input_diffusion_self_cond_topk *>(input.get())) {
             return topk;
+        }
+    }
+
+    return nullptr;
+}
+
+llm_graph_input_diffusion_self_cond_embd * llm_graph_result::get_inp_diffusion_self_cond_embd() const {
+    for (auto & input : inputs) {
+        if (auto * embd = dynamic_cast<llm_graph_input_diffusion_self_cond_embd *>(input.get())) {
+            return embd;
         }
     }
 
@@ -2191,6 +2226,20 @@ llm_graph_input_diffusion_self_cond_topk * llm_graph_context::build_inp_diffusio
     res->add_input(std::move(inp));
 
     return ptr;
+}
+
+ggml_tensor * llm_graph_context::build_inp_diffusion_self_cond_embd(int64_t n_embd) const {
+    auto inp = std::make_unique<llm_graph_input_diffusion_self_cond_embd>(diffusion);
+
+    auto & cur = inp->embd;
+
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(cur);
+    set_diffusion_input_backend(cur);
+
+    res->add_input(std::move(inp));
+
+    return cur;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos_bucket_enc() const {

@@ -47,6 +47,15 @@ static int env_int(const char * name, int def) {
     return v ? atoi(v) : def;
 }
 
+static int diffusion_self_cond_top_k() {
+    constexpr int def = 256;
+    const int k = env_int("GGML_CUDA_DIFFUSION_SC_TOPK", def);
+    if (k <= 0) {
+        return def;
+    }
+    return std::min(k, def);
+}
+
 // apply the model's chat template to the user prompt (this is a chat-trained model)
 static std::string format_chat(llama_model * model, const std::string & prompt) {
     auto tmpls = common_chat_templates_init(model, "");
@@ -287,8 +296,9 @@ int main(int argc, char ** argv) {
     // (renormalized) softmax probabilities per position. Fed to the next decode (Option-2 graph
     // gather: the decoder gathers just these SC_K embedding rows and blends them, instead of a
     // dense full-vocab probs @ token_embd matmul). Zero probs => no self-conditioning (step 1).
-    // SC_K must match llama_model_diffusion_gemma::N_SC_TOPK (the graph's fixed gather width).
-    const int SC_K = 256;
+    // SC_K must match the graph's fixed gather width. Default is 256; use
+    // GGML_CUDA_DIFFUSION_SC_TOPK for gated experiments with a smaller sparse blend.
+    const int SC_K = diffusion_self_cond_top_k();
     std::vector<int32_t> sc_ids ((size_t) SC_K * canvas_length, 0);
     std::vector<float>   sc_probs((size_t) SC_K * canvas_length, 0.0f);
 

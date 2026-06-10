@@ -54,12 +54,20 @@ static constexpr float TEMP_MIN             = 0.4f;
 static constexpr float TEMP_MAX             = 0.8f;
 static constexpr float CONFIDENCE_THRESHOLD = 0.005f;
 static constexpr int   STABILITY_THRESHOLD  = 1;
-static constexpr int   SC_K                 = 256; // must match llama_model_diffusion_gemma::N_SC_TOPK
+static constexpr int   DEF_SC_K             = 256;
 static constexpr int   GPU_SAMPLING_MAX_TOP_K = 1024; // CUDA diffusion sampler limit
 
 static int env_int(const char * name, int def) {
     const char * v = getenv(name);
     return v ? atoi(v) : def;
+}
+
+static int diffusion_self_cond_top_k() {
+    const int k = env_int("GGML_CUDA_DIFFUSION_SC_TOPK", DEF_SC_K);
+    if (k <= 0) {
+        return DEF_SC_K;
+    }
+    return std::min(k, DEF_SC_K);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -236,6 +244,7 @@ struct diffusion_server {
         std::vector<llama_token> argmax_canvas(canvas_length, -1);
         std::vector<llama_token> prev_argmax(canvas_length, -1);
         std::vector<llama_token> accepted(canvas_length);
+        const int SC_K = diffusion_self_cond_top_k();
         std::vector<int32_t>     sc_ids ((size_t) SC_K * canvas_length, 0);
         std::vector<float>       sc_probs((size_t) SC_K * canvas_length, 0.0f);
         std::vector<llama_token> generated;
@@ -822,7 +831,7 @@ int main(int argc, char ** argv) {
                 {"entropy_bound", ENTROPY_BOUND},
                 {"confidence_threshold", CONFIDENCE_THRESHOLD},
                 {"stability_threshold", STABILITY_THRESHOLD},
-                {"self_cond_topk", SC_K},
+                {"self_cond_topk", diffusion_self_cond_top_k()},
                 {"gpu_sampling", srv.use_gpu_sampling},
                 {"device_self_cond", srv.use_device_self_cond},
                 {"device_loop", srv.use_device_loop},
@@ -931,7 +940,7 @@ int main(int argc, char ** argv) {
                 {"params", {
                     {"canvas_length", srv.canvas_length},
                     {"n_denoise_steps", srv.n_steps},
-                    {"self_cond_topk", SC_K},
+                    {"self_cond_topk", diffusion_self_cond_top_k()},
                     {"gpu_sampling", srv.use_gpu_sampling},
                     {"device_self_cond", srv.use_device_self_cond},
                     {"device_loop", srv.use_device_loop},
