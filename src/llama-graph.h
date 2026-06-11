@@ -119,6 +119,12 @@ struct llama_diffusion_cond {
     // superset graph (the decoder adds the self-conditioning input + block on top of the
     // encoder graph). The caller sets the actual phase before every decode.
     bool decoder_phase = true;
+
+    int64_t self_cond_top_k = 256;
+    uint32_t input_gpu_groups = 63;
+    bool fused_self_cond_embd = false;
+    bool fuse_final_logit_softcap = false;
+    bool separate_encoder_decoder = false;
 };
 
 struct llm_graph_params;
@@ -356,7 +362,7 @@ public:
 };
 
 // Dense diffusion self-conditioning embedding input. This is filled by the CUDA sampler from
-// top-k ids/probs when GGML_CUDA_DIFFUSION_FUSED_SELFCOND_EMBD is enabled.
+// top-k ids/probs when the fused diffusion self-conditioning embedding path is enabled.
 class llm_graph_input_diffusion_self_cond_embd : public llm_graph_input_i {
 public:
     llm_graph_input_diffusion_self_cond_embd(const llama_diffusion_cond * diffusion) : diffusion(diffusion) {}

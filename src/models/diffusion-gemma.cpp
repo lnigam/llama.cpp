@@ -4,40 +4,6 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
-#include <cstdlib>
-#include <cstring>
-
-static bool diffusion_gemma_fuse_final_logit_softcap_enabled() {
-    const char * v = std::getenv("GGML_CUDA_DIFFUSION_FUSE_FINAL_SOFTCAP");
-    return v && std::strcmp(v, "0") != 0;
-}
-
-static bool diffusion_gemma_env_enabled_default(const char * name, bool def) {
-    const char * v = std::getenv(name);
-    if (!v) {
-        return def;
-    }
-    return std::strcmp(v, "0") != 0;
-}
-
-static bool diffusion_gemma_fused_selfcond_embd_enabled() {
-    return diffusion_gemma_env_enabled_default("GGML_CUDA_DIFFUSION_FUSED_SELFCOND_EMBD", false) &&
-        diffusion_gemma_env_enabled_default("DG_DEVICE_SELFCOND", true);
-}
-
-static int64_t diffusion_gemma_self_cond_top_k() {
-    const int64_t def = llama_model_diffusion_gemma::N_SC_TOPK;
-    const char * v = std::getenv("GGML_CUDA_DIFFUSION_SC_TOPK");
-    if (!v) {
-        return def;
-    }
-
-    const int64_t k = std::atoll(v);
-    if (k <= 0) {
-        return def;
-    }
-    return std::min(k, def);
-}
 
 // diffusion_gemma reuses the gemma4 decoder block (tensor layout + per-layer math) but runs
 // as a bidirectional (non-causal) block-diffusion denoiser over a canvas, with KV-cache reuse:
@@ -46,7 +12,7 @@ static int64_t diffusion_gemma_self_cond_top_k() {
 // (self-conditioned, bidirectional), rolling back its own K/V afterwards.
 //
 // Two graph variants are provided (see build_arch_graph): a single phase-branching graph, and
-// a separate encoder/decoder pair (DG_SEPARATE_ENC_DEC). Both reuse the gemma4 transformer
+// a separate encoder/decoder pair (--diffusion-separate-encoder-decoder). Both reuse the gemma4 transformer
 // body and differ only in input-embedding handling (encoder: plain; decoder: self-conditioned).
 
 void llama_model_diffusion_gemma::load_arch_hparams(llama_model_loader & ml) {
@@ -159,7 +125,7 @@ void llama_model_diffusion_gemma::load_arch_post(llama_model_loader & ml) {
                            __func__, (long long) n_embd_t, (long long) n_vocab_t,
                            ggml_nbytes(tok_embd_gpu) / (1024.0 * 1024.0 * 1024.0),
                            ggml_backend_buffer_name(tok_embd_gpu->buffer),
-                           (long long) diffusion_gemma_self_cond_top_k());
+                           (long long) llama_model_diffusion_gemma::N_SC_TOPK);
             return;
         }
         LLAMA_LOG_WARN("%s: failed to allocate on-device gather embedding; falling back to dense matmul\n", __func__);
@@ -201,10 +167,10 @@ std::unique_ptr<llm_graph_context> llama_model_diffusion_gemma::build_arch_graph
     const bool is_decoder = params.diffusion && params.diffusion->decoder_phase;
 
     // Variant B ("separate encoder and decoder block", shared weights): opt-in via
-    // DG_SEPARATE_ENC_DEC. Two distinct graphs are built per phase. Functionally identical
+    // --diffusion-separate-encoder-decoder. Two distinct graphs are built per phase. Functionally identical
     // to Variant A here (the checkpoint shares encoder/decoder weights); the split mirrors
     // the HF two-stack structure and generalizes to a checkpoint with distinct weights.
-    if (getenv("DG_SEPARATE_ENC_DEC")) {
+    if (params.diffusion && params.diffusion->separate_encoder_decoder) {
         if (is_decoder) {
             return std::make_unique<graph_decoder>(*this, params);
         }
@@ -233,14 +199,14 @@ ggml_tensor * llama_model_diffusion_gemma::graph_base::build_input(bool is_decod
     if (is_decoder) {
         ggml_tensor * soft; // soft-embedding {n_embd, n_tokens}: blend of the previous step's
                             // predicted token embeddings, scaled by sqrt(n_embd)
-        if (dmodel.tok_embd_gpu && diffusion_gemma_fused_selfcond_embd_enabled()) {
+        if (dmodel.tok_embd_gpu && diffusion && diffusion->fused_self_cond_embd) {
             soft = build_inp_diffusion_self_cond_embd(n_embd);
         } else if (dmodel.tok_embd_gpu) {
             // Sparse gather path (Option-2): the previous step's top-k token ids+probs are fed per
             // position; gather just those k embedding rows and blend them, instead of the dense
             // full-vocab `probs @ token_embd` matmul. Gather width is fixed (N_SC_TOPK) so the
             // graph shape is constant; unused slots carry prob 0 (the CLI zero-pads).
-            const int64_t k = diffusion_gemma_self_cond_top_k();
+            const int64_t k = diffusion ? std::min<int64_t>(std::max<int64_t>(diffusion->self_cond_top_k, 1), llama_model_diffusion_gemma::N_SC_TOPK) : llama_model_diffusion_gemma::N_SC_TOPK;
             auto * inp = build_inp_diffusion_self_cond_topk(k);
             ggml_tensor * ids   = inp->ids;                                                // I32 {k*n_tokens}
             ggml_tensor * probs = inp->probs;                                              // F32 {k, n_tokens}
@@ -461,7 +427,7 @@ void llama_model_diffusion_gemma::graph_base::build_transformer(ggml_tensor * in
     cur = build_lora_mm(model.output, cur, model.output_s);
 
     const bool fuse_final_softcap =
-        diffusion && diffusion->decoder_phase && diffusion_gemma_fuse_final_logit_softcap_enabled();
+        diffusion && diffusion->decoder_phase && diffusion->fuse_final_logit_softcap;
 
     if (hparams.f_final_logit_softcapping && !fuse_final_softcap) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);

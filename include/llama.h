@@ -340,6 +340,8 @@ extern "C" {
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
+        int32_t  diffusion_self_cond_top_k; // sparse self-conditioning width for diffusion models, 0 = model default [EXPERIMENTAL]
+        uint32_t diffusion_input_gpu_groups; // bitmask of diffusion decoder inputs assigned to GPU backend [EXPERIMENTAL]
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -382,6 +384,9 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool diffusion_fused_self_cond_embd;     // use fused diffusion self-conditioning embedding input [EXPERIMENTAL]
+        bool diffusion_fuse_final_logit_softcap; // move diffusion final softcap into sampling [EXPERIMENTAL]
+        bool diffusion_separate_encoder_decoder; // build separate diffusion encoder/decoder graph variants [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1023,6 +1028,14 @@ extern "C" {
         uint32_t seed;
         uint32_t step;
         bool     top_k_tail_correction;
+        bool     cuda_fast_top_k;
+        bool     cuda_direct_self_cond;
+        bool     cuda_final_tokens_on_stop;
+        bool     cuda_fused_top_k_sample;
+        bool     cuda_tight_top_k;
+        bool     cuda_parallel_full_softmax;
+        bool     cuda_fused_full_softmax;
+        int32_t  cuda_top_k_local_k;
     };
 
     struct llama_diffusion_sample_result {

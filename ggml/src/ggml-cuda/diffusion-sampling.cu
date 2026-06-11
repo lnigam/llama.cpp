@@ -4,8 +4,6 @@
 
 #include <algorithm>
 #include <cfloat>
-#include <cstdlib>
-#include <cstring>
 #include <map>
 #include <mutex>
 
@@ -26,35 +24,9 @@ static int next_power_of_2_host(int x) {
     return n;
 }
 
-static bool diffusion_fast_topk_enabled() {
-    const char * v = std::getenv("GGML_CUDA_DIFFUSION_FAST_TOPK");
-    return !v || std::strcmp(v, "0") != 0;
-}
-
-static bool diffusion_direct_selfcond_enabled() {
-    const char * v = std::getenv("GGML_CUDA_DIFFUSION_DIRECT_SELFCOND");
-    return v && std::strcmp(v, "0") != 0;
-}
-
-static bool diffusion_final_tokens_on_stop_enabled() {
-    const char * v = std::getenv("GGML_CUDA_DIFFUSION_FINAL_TOKENS_ON_STOP");
-    return v && std::strcmp(v, "0") != 0;
-}
-
-static bool diffusion_fused_topk_sample_enabled() {
-    const char * v = std::getenv("GGML_CUDA_DIFFUSION_FUSED_TOPK_SAMPLE");
-    return v && std::strcmp(v, "0") != 0;
-}
-
-static bool diffusion_tight_topk_enabled() {
-    const char * v = std::getenv("GGML_CUDA_DIFFUSION_TIGHT_TOPK");
-    return v && std::strcmp(v, "0") != 0;
-}
-
-static int diffusion_topk_local_k(const int heap_k) {
-    int requested = heap_k <= 256 ? 8 : 16;
-    if (const char * v = std::getenv("GGML_CUDA_DIFFUSION_TOPK_LOCAL_K")) {
-        requested = std::atoi(v);
+static int diffusion_topk_local_k(const int heap_k, int requested) {
+    if (requested <= 0) {
+        requested = heap_k <= 256 ? 8 : 16;
     }
 
     const int min_local_k = std::max(1, (heap_k + 255) / 256);
@@ -227,9 +199,10 @@ static void diffusion_select_topk_local(
         const int n_vocab,
         const int n_tokens,
         const int heap_k,
+        const int top_k_local_k,
         cudaStream_t stream) {
     constexpr int block_size = 256;
-    const int local_k = diffusion_topk_local_k(heap_k);
+    const int local_k = diffusion_topk_local_k(heap_k, top_k_local_k);
 
     switch (local_k) {
         case 1: {
@@ -612,6 +585,7 @@ static void diffusion_sample_topk_fused_local(
         const int n_tokens,
         const int top_k,
         const int sc_k,
+        const int top_k_local_k,
         const float inv_temp,
         const float logit_softcap,
         const uint32_t seed,
@@ -623,7 +597,7 @@ static void diffusion_sample_topk_fused_local(
         float * sc_probs,
         cudaStream_t stream) {
     constexpr int block_size = 256;
-    const int local_k = diffusion_topk_local_k(top_k);
+    const int local_k = diffusion_topk_local_k(top_k, top_k_local_k);
 
     switch (local_k) {
         case 1: {
@@ -664,6 +638,243 @@ static void diffusion_sample_topk_fused_local(
                                 2 * block_size * sizeof(float);
             diffusion_sample_topk_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
                     logits, n_vocab, n_tokens, top_k, sc_k, inv_temp, logit_softcap, seed, step,
+                    sampled, argmax, entropy, sc_ids, sc_probs);
+        } break;
+    }
+}
+
+template<int LOCAL_K>
+static __global__ void diffusion_sample_full_softmax_fused_local_kernel(
+        const float * __restrict__ logits,
+        const int n_vocab,
+        const int n_tokens,
+        const int sc_k,
+        const float inv_temp,
+        const float logit_softcap,
+        const uint32_t seed,
+        const uint32_t step,
+        int * __restrict__ sampled,
+        int * __restrict__ argmax,
+        float * __restrict__ entropy,
+        int * __restrict__ sc_ids,
+        float * __restrict__ sc_probs) {
+    constexpr int block_size = 256;
+    constexpr int candidate_count = LOCAL_K * block_size;
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (row >= n_tokens) {
+        return;
+    }
+
+    float vals[LOCAL_K];
+    int ids[LOCAL_K];
+#pragma unroll
+    for (int i = 0; i < LOCAL_K; ++i) {
+        vals[i] = -FLT_MAX;
+        ids[i] = 0;
+    }
+
+    const float * row_logits = logits + (size_t) row * n_vocab;
+    float local_max = -FLT_MAX;
+    int local_idx = 0;
+    for (int v = tid; v < n_vocab; v += blockDim.x) {
+        const float raw = row_logits[v];
+        const float x = diffusion_apply_logit_softcap(raw, logit_softcap) * inv_temp;
+        if (x > local_max) {
+            local_max = x;
+            local_idx = v;
+        }
+        if (diffusion_should_swap_desc(vals[LOCAL_K - 1], ids[LOCAL_K - 1], raw, v)) {
+            int pos = LOCAL_K - 1;
+#pragma unroll
+            for (int i = LOCAL_K - 1; i > 0; --i) {
+                if (pos == i && diffusion_should_swap_desc(vals[i - 1], ids[i - 1], raw, v)) {
+                    vals[i] = vals[i - 1];
+                    ids[i] = ids[i - 1];
+                    --pos;
+                }
+            }
+            vals[pos] = raw;
+            ids[pos] = v;
+        }
+    }
+
+    extern __shared__ unsigned char smem[];
+    float * s_vals = (float *) smem;
+    int * s_ids = (int *) (s_vals + candidate_count);
+    int * s_max_ids = s_ids + candidate_count;
+    float * s_sum = (float *) (s_max_ids + block_size);
+    float * s_t = s_sum + block_size;
+    float * s_cdf = s_t + block_size;
+    __shared__ int s_sampled;
+
+#pragma unroll
+    for (int i = 0; i < LOCAL_K; ++i) {
+        const int dst = tid * LOCAL_K + i;
+        s_vals[dst] = vals[i];
+        s_ids[dst] = ids[i];
+    }
+    s_sum[tid] = local_max;
+    s_max_ids[tid] = local_idx;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && s_sum[tid + stride] > s_sum[tid]) {
+            s_sum[tid] = s_sum[tid + stride];
+            s_max_ids[tid] = s_max_ids[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    const float max_l = s_sum[0];
+    const int amax = s_max_ids[0];
+
+    for (int k = 2; k <= candidate_count; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < candidate_count; i += blockDim.x) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    const bool descending = (i & k) == 0;
+                    const bool swap = descending
+                        ? diffusion_should_swap_desc(s_vals[i], s_ids[i], s_vals[ixj], s_ids[ixj])
+                        : diffusion_should_swap_desc(s_vals[ixj], s_ids[ixj], s_vals[i], s_ids[i]);
+                    if (swap) {
+                        const float tv = s_vals[i];
+                        s_vals[i] = s_vals[ixj];
+                        s_vals[ixj] = tv;
+                        const int ti = s_ids[i];
+                        s_ids[i] = s_ids[ixj];
+                        s_ids[ixj] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    float local_sum = 0.0f;
+    float local_t = 0.0f;
+    for (int v = tid; v < n_vocab; v += blockDim.x) {
+        const float d = diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp - max_l;
+        const float e = expf(d);
+        local_sum += e;
+        local_t += d * e;
+    }
+
+    s_sum[tid] = local_sum;
+    s_t[tid] = local_t;
+    s_cdf[tid] = local_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sum[tid] += s_sum[tid + stride];
+            s_t[tid] += s_t[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    const float z = s_sum[0];
+    const float t = s_t[0];
+
+    if (tid == 0) {
+        argmax[row] = amax;
+        entropy[row] = logf(z) - t / z;
+        s_sampled = amax;
+    }
+    __syncthreads();
+
+    for (int stride = 1; stride < blockDim.x; stride <<= 1) {
+        const float add = tid >= stride ? s_cdf[tid - stride] : 0.0f;
+        __syncthreads();
+        s_cdf[tid] += add;
+        __syncthreads();
+    }
+
+    const float r = diffusion_rng_uniform(seed, step, row) * z;
+    const float chunk_begin = tid == 0 ? 0.0f : s_cdf[tid - 1];
+    const float chunk_end   = s_cdf[tid];
+    if (r > chunk_begin && r <= chunk_end) {
+        float thread_cum = chunk_begin;
+        for (int v = tid; v < n_vocab; v += blockDim.x) {
+            thread_cum += expf(diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp - max_l);
+            if (thread_cum >= r) {
+                s_sampled = v;
+                break;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        sampled[row] = s_sampled;
+        for (int i = 0; i < sc_k; ++i) {
+            const int out = row * sc_k + i;
+            sc_ids[out] = s_ids[i];
+            sc_probs[out] = expf(diffusion_apply_logit_softcap(s_vals[i], logit_softcap) * inv_temp - max_l) / z;
+        }
+    }
+}
+
+static void diffusion_sample_full_softmax_fused_local(
+        const float * logits,
+        const int n_vocab,
+        const int n_tokens,
+        const int sc_k,
+        const int top_k_local_k,
+        const float inv_temp,
+        const float logit_softcap,
+        const uint32_t seed,
+        const uint32_t step,
+        int * sampled,
+        int * argmax,
+        float * entropy,
+        int * sc_ids,
+        float * sc_probs,
+        cudaStream_t stream) {
+    constexpr int block_size = 256;
+    const int local_k = diffusion_topk_local_k(sc_k, top_k_local_k);
+
+    switch (local_k) {
+        case 1: {
+            constexpr int local_k_t = 1;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
+                                3 * block_size * sizeof(float) + block_size * sizeof(int);
+            diffusion_sample_full_softmax_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, n_vocab, n_tokens, sc_k, inv_temp, logit_softcap, seed, step,
+                    sampled, argmax, entropy, sc_ids, sc_probs);
+        } break;
+        case 2: {
+            constexpr int local_k_t = 2;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
+                                3 * block_size * sizeof(float) + block_size * sizeof(int);
+            diffusion_sample_full_softmax_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, n_vocab, n_tokens, sc_k, inv_temp, logit_softcap, seed, step,
+                    sampled, argmax, entropy, sc_ids, sc_probs);
+        } break;
+        case 4: {
+            constexpr int local_k_t = 4;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
+                                3 * block_size * sizeof(float) + block_size * sizeof(int);
+            diffusion_sample_full_softmax_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, n_vocab, n_tokens, sc_k, inv_temp, logit_softcap, seed, step,
+                    sampled, argmax, entropy, sc_ids, sc_probs);
+        } break;
+        case 8: {
+            constexpr int local_k_t = 8;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
+                                3 * block_size * sizeof(float) + block_size * sizeof(int);
+            diffusion_sample_full_softmax_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, n_vocab, n_tokens, sc_k, inv_temp, logit_softcap, seed, step,
+                    sampled, argmax, entropy, sc_ids, sc_probs);
+        } break;
+        default: {
+            constexpr int local_k_t = 16;
+            const size_t smem = (size_t) local_k_t * block_size * (sizeof(float) + sizeof(int)) +
+                                3 * block_size * sizeof(float) + block_size * sizeof(int);
+            diffusion_sample_full_softmax_fused_local_kernel<local_k_t><<<n_tokens, block_size, smem, stream>>>(
+                    logits, n_vocab, n_tokens, sc_k, inv_temp, logit_softcap, seed, step,
                     sampled, argmax, entropy, sc_ids, sc_probs);
         } break;
     }
@@ -803,6 +1014,7 @@ static __global__ void diffusion_sample_kernel(
         const uint32_t seed,
         const uint32_t step,
         const bool tail_correction,
+        const bool parallel_full_softmax_sample,
         int * __restrict__ sampled,
         int * __restrict__ argmax,
         float * __restrict__ entropy,
@@ -816,7 +1028,9 @@ static __global__ void diffusion_sample_kernel(
 
     __shared__ float s_val[1024];
     __shared__ float s_sum[1024];
+    __shared__ float s_cdf[1024];
     __shared__ int   s_idx[1024];
+    __shared__ int   s_sampled;
 
     const float * row_logits = logits + (size_t) row * n_vocab;
     const int * row_top = top_ids + (size_t) row * heap_k;
@@ -880,6 +1094,7 @@ static __global__ void diffusion_sample_kernel(
 
     s_sum[tid] = local_sum;
     s_val[tid] = local_t;
+    s_cdf[tid] = local_sum;
     __syncthreads();
 
     for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
@@ -910,7 +1125,7 @@ static __global__ void diffusion_sample_kernel(
         float cum = 0.0f;
         int tok = amax;
 
-        if (top_k == 0) {
+        if (top_k == 0 && !parallel_full_softmax_sample) {
             for (int v = 0; v < n_vocab; ++v) {
                 cum += expf(diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp - max_l);
                 if (cum >= r) {
@@ -941,6 +1156,40 @@ static __global__ void diffusion_sample_kernel(
                 sc_ids[out] = 0;
                 sc_probs[out] = 0.0f;
             }
+        }
+    }
+
+    if (top_k == 0 && parallel_full_softmax_sample) {
+        for (int stride = 1; stride < blockDim.x; stride <<= 1) {
+            const float add = tid >= stride ? s_cdf[tid - stride] : 0.0f;
+            __syncthreads();
+            s_cdf[tid] += add;
+            __syncthreads();
+        }
+
+        const float z = s_sum[0];
+        const float r = diffusion_rng_uniform(seed, step, row) * z;
+        if (tid == 0) {
+            s_sampled = amax;
+        }
+        __syncthreads();
+
+        const float chunk_begin = tid == 0 ? 0.0f : s_cdf[tid - 1];
+        const float chunk_end   = s_cdf[tid];
+        if (r > chunk_begin && r <= chunk_end) {
+            float thread_cum = chunk_begin;
+            for (int v = tid; v < n_vocab; v += blockDim.x) {
+                thread_cum += expf(diffusion_apply_logit_softcap(row_logits[v], logit_softcap) * inv_temp - max_l);
+                if (thread_cum >= r) {
+                    s_sampled = v;
+                    break;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            sampled[row] = s_sampled;
         }
     }
 }
@@ -1042,7 +1291,7 @@ bool ggml_cuda_diffusion_sample_topk(
         }
     }
 
-    const int heap_k = top_k == 0 || !diffusion_tight_topk_enabled() ? std::max(top_k, sc_k) : top_k;
+    const int heap_k = top_k == 0 || !params->tight_top_k ? std::max(top_k, sc_k) : top_k;
     if (heap_k <= 0 || heap_k > 1024 || heap_k > n_vocab) {
         return false;
     }
@@ -1060,25 +1309,33 @@ bool ggml_cuda_diffusion_sample_topk(
 
     diffusion_sample_scratch * scratch = diffusion_get_scratch(stream, n_tokens, heap_k, sc_k);
     int * top_ids = scratch->top_ids;
-    const bool direct_self_cond_tensor = have_self_cond_tensor && !have_self_cond_host && diffusion_direct_selfcond_enabled();
+    const bool direct_self_cond_tensor = have_self_cond_tensor && !have_self_cond_host && params->direct_self_cond;
     int * sc_ids_out = direct_self_cond_tensor ? (int *) result->self_cond_ids_tensor->data : scratch->sc_ids;
     float * sc_probs_out = direct_self_cond_tensor ? (float *) result->self_cond_probs_tensor->data : scratch->sc_probs;
 
     constexpr int block_size = 256;
     bool sync_required = false;
-    const bool use_fused_topk_sample = diffusion_fused_topk_sample_enabled() &&
+    const bool use_fused_topk_sample = params->fused_top_k_sample &&
         top_k > 0 && top_k <= block_size && !params->top_k_tail_correction && n_vocab >= top_k;
+    const bool use_fused_full_softmax_sample =
+        top_k == 0 && !params->top_k_tail_correction && params->fused_full_softmax;
+    const bool use_parallel_full_softmax_sample =
+        top_k == 0 && !use_fused_full_softmax_sample && params->parallel_full_softmax;
 
     if (use_fused_topk_sample) {
-        diffusion_sample_topk_fused_local(logits_d, n_vocab, n_tokens, top_k, sc_k, inv_temp, logit_softcap,
+        diffusion_sample_topk_fused_local(logits_d, n_vocab, n_tokens, top_k, sc_k, params->top_k_local_k, inv_temp, logit_softcap,
+                params->seed, params->step, scratch->sampled, scratch->argmax, scratch->entropy,
+                sc_ids_out, sc_probs_out, stream);
+    } else if (use_fused_full_softmax_sample) {
+        diffusion_sample_full_softmax_fused_local(logits_d, n_vocab, n_tokens, sc_k, params->top_k_local_k, inv_temp, logit_softcap,
                 params->seed, params->step, scratch->sampled, scratch->argmax, scratch->entropy,
                 sc_ids_out, sc_probs_out, stream);
     } else {
         bool top_ids_sorted = false;
-        const bool use_fast_topk = diffusion_fast_topk_enabled() && heap_k <= 1024 && n_vocab >= heap_k;
+        const bool use_fast_topk = params->fast_top_k && heap_k <= 1024 && n_vocab >= heap_k;
         sync_required = !use_fast_topk;
         if (use_fast_topk) {
-            diffusion_select_topk_local(logits_d, top_ids, n_vocab, n_tokens, heap_k, stream);
+            diffusion_select_topk_local(logits_d, top_ids, n_vocab, n_tokens, heap_k, params->top_k_local_k, stream);
             top_ids_sorted = true;
         } else {
 #ifdef CUB_DIFFUSION_TOP_K_AVAILABLE
@@ -1116,6 +1373,7 @@ bool ggml_cuda_diffusion_sample_topk(
         diffusion_sample_kernel<<<n_tokens, block_size, 0, stream>>>(
                 logits_d, top_ids, n_vocab, n_tokens, top_k, heap_k, sc_k, inv_temp,
                 logit_softcap, params->seed, params->step, params->top_k_tail_correction,
+                use_parallel_full_softmax_sample,
                 scratch->sampled, scratch->argmax, scratch->entropy,
                 sc_ids_out, sc_probs_out);
     }
@@ -1148,7 +1406,7 @@ bool ggml_cuda_diffusion_sample_topk(
     }
     const bool final_tokens_after_stop =
         result->final_tokens && result->stop && result->check_stop_on_device &&
-        diffusion_final_tokens_on_stop_enabled();
+        params->final_tokens_on_stop;
 
     if (result->final_tokens && !final_tokens_after_stop) {
         CUDA_CHECK(cudaMemcpyAsync(result->final_tokens, scratch->argmax, (size_t) n_tokens * sizeof(int),

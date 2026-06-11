@@ -197,6 +197,12 @@ llama_context::llama_context(
 
     cparams.n_outputs_max = params.n_outputs_max == 0 ? cparams.n_batch : params.n_outputs_max;
 
+    diffusion_cond.self_cond_top_k = params.diffusion_self_cond_top_k > 0 ? params.diffusion_self_cond_top_k : 256;
+    diffusion_cond.input_gpu_groups = params.diffusion_input_gpu_groups;
+    diffusion_cond.fused_self_cond_embd = params.diffusion_fused_self_cond_embd;
+    diffusion_cond.fuse_final_logit_softcap = params.diffusion_fuse_final_logit_softcap;
+    diffusion_cond.separate_encoder_decoder = params.diffusion_separate_encoder_decoder;
+
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
@@ -1204,16 +1210,6 @@ static ggml_backend_cuda_diffusion_sample_topk_t get_cuda_diffusion_sample_topk_
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_diffusion_sample_topk");
 }
 
-static bool diffusion_cuda_fuse_final_logit_softcap_enabled() {
-    const char * v = std::getenv("GGML_CUDA_DIFFUSION_FUSE_FINAL_SOFTCAP");
-    return v && std::strcmp(v, "0") != 0;
-}
-
-static bool diffusion_cuda_fused_selfcond_embd_enabled() {
-    const char * v = std::getenv("GGML_CUDA_DIFFUSION_FUSED_SELFCOND_EMBD");
-    return v && std::strcmp(v, "0") != 0;
-}
-
 static bool diffusion_decoder_inputs_device_ready(
         const llama_diffusion_cond & diffusion_cond,
         const llm_graph_result * res) {
@@ -1292,7 +1288,7 @@ bool llama_context::diffusion_sample_topk(
     const bool device_self_cond = result->self_cond_ids == nullptr && result->self_cond_probs == nullptr;
     if (device_self_cond) {
         auto * inp_embd = gf_res_prev->get_inp_diffusion_self_cond_embd();
-        if (inp_embd && diffusion_cuda_fused_selfcond_embd_enabled()) {
+        if (inp_embd && diffusion_cond.fused_self_cond_embd) {
             t_self_cond_embd = inp_embd->embd;
             t_token_embd = gf_res_prev->get_diffusion_token_embd();
             if (!t_self_cond_embd || !t_token_embd) {
@@ -1317,7 +1313,7 @@ bool llama_context::diffusion_sample_topk(
         }
     }
 
-    const float fused_logit_softcap = diffusion_cuda_fuse_final_logit_softcap_enabled()
+    const float fused_logit_softcap = diffusion_cond.fuse_final_logit_softcap
         ? model.hparams.f_final_logit_softcapping
         : 0.0f;
 
@@ -1331,6 +1327,14 @@ bool llama_context::diffusion_sample_topk(
         /* .step                  = */ params->step,
         /* .top_k_tail_correction = */ params->top_k_tail_correction,
         /* .logit_softcap         = */ fused_logit_softcap,
+        /* .fast_top_k            = */ params->cuda_fast_top_k,
+        /* .direct_self_cond      = */ params->cuda_direct_self_cond,
+        /* .final_tokens_on_stop  = */ params->cuda_final_tokens_on_stop,
+        /* .fused_top_k_sample    = */ params->cuda_fused_top_k_sample,
+        /* .tight_top_k           = */ params->cuda_tight_top_k,
+        /* .parallel_full_softmax = */ params->cuda_parallel_full_softmax,
+        /* .fused_full_softmax    = */ params->cuda_fused_full_softmax,
+        /* .top_k_local_k         = */ params->cuda_top_k_local_k,
     };
 
     ggml_cuda_diffusion_sample_result cuda_result = {
@@ -3628,6 +3632,8 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
+        /*.diffusion_self_cond_top_k   =*/ 256,
+        /*.diffusion_input_gpu_groups  =*/ 63,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
@@ -3655,6 +3661,9 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.diffusion_fused_self_cond_embd =*/ false,
+        /*.diffusion_fuse_final_logit_softcap =*/ false,
+        /*.diffusion_separate_encoder_decoder =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

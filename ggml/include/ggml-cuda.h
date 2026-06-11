@@ -53,6 +53,14 @@ struct ggml_cuda_diffusion_sample_params {
     uint32_t step;
     bool     top_k_tail_correction;
     float    logit_softcap;
+    bool     fast_top_k;
+    bool     direct_self_cond;
+    bool     final_tokens_on_stop;
+    bool     fused_top_k_sample;
+    bool     tight_top_k;
+    bool     parallel_full_softmax;
+    bool     fused_full_softmax;
+    int32_t  top_k_local_k;
 };
 
 struct ggml_cuda_diffusion_sample_result {
